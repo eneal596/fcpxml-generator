@@ -375,12 +375,8 @@ def timeline_to_fcpxml(timeline):
             pass
 
 
-def inject_sequence_format(sequence_xml, dimensions):
-    """
-    OTIO fcp_xml adapter writes <format/> empty inside each sequence's <video>
-    block. Premiere then creates a default-resolution sequence instead of our
-    intended 1080x1920. Inject explicit format details.
-    """
+def inject_sequence_format_throughout(combined_xml, dimensions):
+    """Replace every empty <format/> in the document with proper 1080x1920 details."""
     width, height = dimensions
     format_block = f"""<format>
                             <samplecharacteristics>
@@ -395,47 +391,50 @@ def inject_sequence_format(sequence_xml, dimensions):
                                 <colordepth>24</colordepth>
                             </samplecharacteristics>
                         </format>"""
-    
-    return sequence_xml.replace("<format/>", format_block)
+    return combined_xml.replace("<format/>", format_block)
 
 
-def deduplicate_avatar_file(sequence_xml, shared_file_id="file-shared-avatar"):
+def deduplicate_avatar_throughout(combined_xml):
     """
-    Replace per-sequence avatar file definitions with a reference to a shared
-    file ID. The first occurrence keeps its full definition (renamed), subsequent
-    occurrences become bare <file id="..."/> references.
-    
-    A separate pass at the project level inserts the canonical definition once.
+    Two-pass cleanup:
+    1. Find every full <file id="file-N">...<pathurl>./avatar.mp4</pathurl>...</file>
+       block. Keep the FIRST as canonical, replace others with bare references.
+    2. After dedup, find any remaining bare <file id="file-X"/> references whose
+       ID is NOT defined anywhere — redirect them to the canonical avatar.
+       (These are OTIO\'s internal back-references that get orphaned by ID renumbering.)
     """
-    # Find every <file id="file-N"> block whose <pathurl> is ./avatar.mp4
-    # Replace each with a bare reference <file id="file-shared-avatar"/>
-    import re
-    
-    # Match the full file block
     pattern = re.compile(
-        r'<file id="file-\d+">\s*<pathurl>\./avatar\.mp4</pathurl>.*?</file>',
+        r'<file id="(file-\d+)">(\s*<pathurl>\./avatar\.mp4</pathurl>.*?)</file>',
         re.DOTALL,
     )
     
-    # Replace with bare reference
-    return pattern.sub(f'<file id="{shared_file_id}"/>', sequence_xml)
-
-
-def extract_one_avatar_definition(sequence_xml, shared_file_id="file-shared-avatar"):
-    """
-    Pull one full avatar <file>...</file> block from the XML, with its ID
-    renamed to the shared ID. Used to define the avatar once at project level.
-    """
-    import re
-    pattern = re.compile(
-        r'<file id="file-\d+">(\s*<pathurl>\./avatar\.mp4</pathurl>.*?)</file>',
-        re.DOTALL,
-    )
-    match = pattern.search(sequence_xml)
-    if not match:
-        return None
-    inner = match.group(1)
-    return f'<file id="{shared_file_id}">{inner}</file>'
+    matches = list(pattern.finditer(combined_xml))
+    
+    if not matches:
+        return combined_xml
+    
+    canonical_id = matches[0].group(1)
+    
+    if len(matches) > 1:
+        result = combined_xml
+        for m in reversed(matches[1:]):
+            start, end = m.span()
+            bare_ref = f'<file id="{canonical_id}"/>'
+            result = result[:start] + bare_ref + result[end:]
+        combined_xml = result
+    
+    # Pass 2: redirect dangling references to canonical avatar
+    all_definitions = set(re.findall(r'<file id="(file-\d+)">', combined_xml))
+    
+    def fix_ref(m):
+        ref_id = m.group(1)
+        if ref_id in all_definitions:
+            return m.group(0)
+        return f'<file id="{canonical_id}"/>'
+    
+    combined_xml = re.sub(r'<file id="(file-\d+)"/>', fix_ref, combined_xml)
+    
+    return combined_xml
 
 
 def build_combined_fcpxml(sequences_xml_list, project_name, dimensions):
@@ -444,25 +443,19 @@ def build_combined_fcpxml(sequences_xml_list, project_name, dimensions):
     in one file, we generate each timeline separately, then merge their <sequence>
     elements into a single <project>.
     
-    Improvements:
-    - All file/clipitem IDs renumbered to be globally unique
-    - Sequence format dimensions injected (1080x1920)
-    - Avatar file deduplicated to a single shared definition
+    Pipeline:
+    1. Renumber file/clipitem/sequence IDs to be globally unique across sequences
+    2. Combine all sequences into one <project><children>...</children></project>
+    3. Post-process: inject 1080x1920 format details into every <format/>
+    4. Post-process: deduplicate the avatar file definition (keep first, ref the rest)
     """
-    SHARED_AVATAR_ID = "file-shared-avatar"
-    
-    # Single-sequence case: still inject format details
+    # Single-sequence: still inject format AND fix dangling avatar refs
     if len(sequences_xml_list) == 1:
-        return inject_sequence_format(sequences_xml_list[0], dimensions)
+        result = inject_sequence_format_throughout(sequences_xml_list[0], dimensions)
+        result = deduplicate_avatar_throughout(result)
+        return result
     
-    # Extract one canonical avatar file definition to use across all sequences
-    avatar_definition = None
-    for xml in sequences_xml_list:
-        avatar_definition = extract_one_avatar_definition(xml, SHARED_AVATAR_ID)
-        if avatar_definition:
-            break
-    
-    # Pull each <sequence>...</sequence> block, then renumber and dedupe
+    # Renumber IDs so they're globally unique
     sequence_blocks = []
     id_offset = 0
     for i, xml in enumerate(sequences_xml_list):
@@ -471,7 +464,6 @@ def build_combined_fcpxml(sequences_xml_list, project_name, dimensions):
             continue
         block = match.group(1)
         
-        # Find all numeric IDs in this block
         all_ids = re.findall(r'id="(?:sequence|clipitem|file)-(\d+)"', block)
         max_id_in_block = max([int(x) for x in all_ids]) if all_ids else 0
         
@@ -486,33 +478,29 @@ def build_combined_fcpxml(sequences_xml_list, project_name, dimensions):
             block,
         )
         
-        # Inject format dimensions
-        block = inject_sequence_format(block, dimensions)
-        
-        # Replace per-sequence avatar file definitions with shared reference
-        if avatar_definition:
-            block = deduplicate_avatar_file(block, SHARED_AVATAR_ID)
-        
         sequence_blocks.append(block)
         id_offset += max_id_in_block + 1
     
     if not sequence_blocks:
         return sequences_xml_list[0]
     
-    # Build the combined project. The shared avatar file definition goes at the
-    # project level so it loads once and is referenced by all sequences.
     combined_children = "\n            ".join(sequence_blocks)
-    avatar_def_xml = f"\n            {avatar_definition}\n            " if avatar_definition else ""
     
     combined_xml = f"""<?xml version="1.0" ?>
 <xmeml version="4">
     <project>
         <name>{project_name}</name>
-        <children>{avatar_def_xml}{combined_children}
+        <children>
+            {combined_children}
         </children>
     </project>
 </xmeml>
 """
+    
+    # Post-process: inject format and dedupe avatar
+    combined_xml = inject_sequence_format_throughout(combined_xml, dimensions)
+    combined_xml = deduplicate_avatar_throughout(combined_xml)
+    
     return combined_xml
 
 
@@ -758,7 +746,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "fcpxml-generator",
-        "version": "v6-shared-avatar-1080x1920",
+        "version": "v7-shared-avatar-clean",
         "otio_version": otio.__version__,
     })
 
@@ -767,7 +755,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator",
-        "version": "v6 (Shared Avatar + 1080x1920 Sequence)",
+        "version": "v7 (Shared Avatar + 1080x1920, Premiere-safe)",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes",
             "GET /health": "Health check",
