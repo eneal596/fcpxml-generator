@@ -110,6 +110,45 @@ def make_placeholder_clip(label, duration_seconds):
     )
 
 
+def close_inter_beat_gaps(outcomes, max_gap_to_close=2.0):
+    """
+    Mutate outcome beats so consecutive clips have no visible gap between them.
+    For each pair of consecutive beats with a gap less than max_gap_to_close seconds,
+    move the gap split-point to the midpoint: extend the earlier beat\'s endTime
+    and pull the later beat\'s startTime forward to that midpoint.
+    
+    Larger gaps (e.g., a long pause in the audio) are left alone — they probably
+    represent intentional silence.
+    """
+    sorted_outcomes = sorted(
+        outcomes, key=lambda o: (o.get("beat", {}).get("startTime") or 0)
+    )
+    
+    for i in range(len(sorted_outcomes) - 1):
+        current = sorted_outcomes[i]
+        next_ = sorted_outcomes[i + 1]
+        
+        current_beat = current.get("beat") or {}
+        next_beat = next_.get("beat") or {}
+        
+        cur_end = current_beat.get("endTime")
+        next_start = next_beat.get("startTime")
+        
+        if cur_end is None or next_start is None:
+            continue
+        
+        gap = next_start - cur_end
+        if 0 < gap <= max_gap_to_close:
+            midpoint = cur_end + (gap / 2.0)
+            current_beat["endTime"] = midpoint
+            next_beat["startTime"] = midpoint
+            # Recompute durations to match
+            current_beat["duration"] = midpoint - (current_beat.get("startTime") or 0)
+            next_beat["duration"] = (next_beat.get("endTime") or midpoint) - midpoint
+    
+    return sorted_outcomes
+
+
 def build_track_for_outcomes(outcomes, asset_ids, segment_start, segment_end):
     """
     Build a video track containing B-roll/placeholder clips for outcomes
@@ -336,34 +375,53 @@ def timeline_to_fcpxml(timeline):
             pass
 
 
-def build_combined_fcpxml(sequences_xml_list):
+def build_combined_fcpxml(sequences_xml_list, project_name):
     """
     OTIO's fcp_xml adapter writes one project per file. To get multiple sequences
     in one file, we generate each timeline separately, then merge their <sequence>
     elements into a single <project>.
     
-    Returns the combined FCPXML as a single string.
+    All file/clipitem IDs are renumbered to be globally unique across sequences,
+    otherwise Premiere silently discards duplicates.
     """
     if len(sequences_xml_list) == 1:
         return sequences_xml_list[0]
     
-    # Pull the <sequence>...</sequence> blocks from each generated XML
+    # Pull each <sequence>...</sequence> block, then renumber its IDs
     sequence_blocks = []
-    for xml in sequences_xml_list:
-        # Find the sequence element
+    id_offset = 0
+    for i, xml in enumerate(sequences_xml_list):
         match = re.search(r'(<sequence[^>]*>.*?</sequence>)', xml, re.DOTALL)
-        if match:
-            sequence_blocks.append(match.group(1))
+        if not match:
+            continue
+        block = match.group(1)
+        
+        # Find all numeric IDs in this block (id="sequence-1", id="clipitem-3", id="file-2")
+        # and offset them by id_offset to make them globally unique
+        # Strategy: find the highest ID in this block, then shift everything up
+        all_ids = re.findall(r'id="(?:sequence|clipitem|file)-(\d+)"', block)
+        max_id_in_block = max([int(x) for x in all_ids]) if all_ids else 0
+        
+        def shift_id(m):
+            prefix = m.group(1)
+            num = int(m.group(2))
+            return f'id="{prefix}-{num + id_offset}"'
+        
+        # Only shift the FIRST occurrence (the definition); references to file-X
+        # within the same sequence need to stay consistent. Use a simpler regex
+        # that catches both definitions and references:
+        block = re.sub(
+            r'id="(sequence|clipitem|file)-(\d+)"',
+            shift_id,
+            block,
+        )
+        # Also handle <file id="file-X"/> reference style — already covered above
+        
+        sequence_blocks.append(block)
+        id_offset += max_id_in_block + 1  # next sequence starts above this one
     
     if not sequence_blocks:
-        # Fallback — just return the first
         return sequences_xml_list[0]
-    
-    # Use the first XML as the template, replace its <children>...</children>
-    # block with our combined sequences
-    template = sequences_xml_list[0]
-    project_name_match = re.search(r'<project>\s*<name>([^<]+)</name>', template)
-    project_name = project_name_match.group(1) if project_name_match else "Project"
     
     combined_children = "\n            ".join(sequence_blocks)
     
@@ -383,6 +441,9 @@ def build_combined_fcpxml(sequences_xml_list):
 def build_fcpxml(project_settings, outcomes, total_audio_duration):
     tab_name = project_settings.get("tabName", "Untitled")
     video_type = project_settings.get("videoType", "narrated_story")
+    
+    # Close small gaps between consecutive beats so the timeline has no black frames
+    outcomes = close_inter_beat_gaps(outcomes, max_gap_to_close=2.0)
     
     hooks, body_start, body_end = identify_hook_segments(outcomes, total_audio_duration)
     
@@ -423,7 +484,7 @@ def build_fcpxml(project_settings, outcomes, total_audio_duration):
         )
         sequences_xml.append(timeline_to_fcpxml(timeline))
     
-    return build_combined_fcpxml(sequences_xml)
+    return build_combined_fcpxml(sequences_xml, tab_name)
 
 
 def build_concatenated_timeline(name, outcomes, video_type, segments):
@@ -617,7 +678,7 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "fcpxml-generator",
-        "version": "v4-multi-sequence",
+        "version": "v5-fixed-ids-no-gaps",
         "otio_version": otio.__version__,
     })
 
@@ -626,7 +687,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator",
-        "version": "v4 (Multi-Sequence + Placeholders)",
+        "version": "v5 (Fixed IDs + Closed Gaps)",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes",
             "GET /health": "Health check",
