@@ -670,68 +670,13 @@ def wrap_in_bins(combined_xml):
         start, end = m.span(1)
         result = result[:start] + new_bin + result[end:]
     
-    # Now collect unique media files from the XML to build Footage and Placeholders bins.
-    # We want each unique file referenced exactly once at the bin level.
-    
-    # Find all full <file> definitions (those with <pathurl>...)
-    file_def_pattern = re.compile(
-        r'<file id="(file-\d+)">\s*<pathurl>([^<]+)</pathurl>\s*<name>([^<]+)</name>.*?</file>',
-        re.DOTALL,
-    )
-    
-    footage_clips = []
-    placeholder_clips = []
-    
-    clip_id_counter = 9000
-    seen_keys = set()  # dedupe by (path) — same file in multiple sequences shows once
-    
-    for fm in file_def_pattern.finditer(result):
-        file_id = fm.group(1)
-        path = fm.group(2)
-        name = fm.group(3)
-        
-        # Dedupe by full path — multiple <file> definitions of the same clip
-        # (one per sequence after ID renumbering) collapse to a single bin entry
-        if path in seen_keys:
-            continue
-        seen_keys.add(path)
-        
-        clip_id_counter += 1
-        
-        clip_xml = f"""<clip id="bin-clip-{clip_id_counter}">
-                        <name>{name}</name>
-                        <file id="{file_id}"/>
-                    </clip>"""
-        
-        if "_PLACEHOLDERS/" in path:
-            placeholder_clips.append(clip_xml)
-        else:
-            footage_clips.append(clip_xml)
-    
-    # Build Footage and Placeholders bins (only if they have content)
-    extra_bins = []
-    if footage_clips:
-        footage_bin = f"""<bin>
-                <name>Footage</name>
-                <children>
-                    {"".join(footage_clips)}
-                </children>
-            </bin>"""
-        extra_bins.append(footage_bin)
-    
-    if placeholder_clips:
-        placeholder_bin = f"""<bin>
-                <name>Placeholders</name>
-                <children>
-                    {"".join(placeholder_clips)}
-                </children>
-            </bin>"""
-        extra_bins.append(placeholder_bin)
-    
-    # Insert Footage and Placeholders bins right before </children> of the project
-    if extra_bins:
-        extras_xml = "\n            " + "\n            ".join(extra_bins) + "\n        "
-        result = result.replace("</children>\n    </project>", extras_xml + "</children>\n    </project>")
+    # Note: previous versions tried to add explicit Footage/Placeholders bins
+    # using bare <file id=".."/> references, but FCP7 XML requires standalone
+    # <clip> elements in bins to have their own full <file> definition with
+    # <pathurl> etc. Bare references caused Premiere import failures.
+    # 
+    # For now we only wrap sequences in Hook bins. Premiere will auto-place
+    # the media items somewhere on import, which the editor can rearrange.
     
     return result
 
@@ -842,7 +787,7 @@ def health():
         drive_ok = f"Error: {e}"
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v15-explicit-bins",
+        "version": "v16-hook-bins-only",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
@@ -854,7 +799,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator + Asset Downloader",
-        "version": "v15",
+        "version": "v16",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes",
             "POST /download-to-drive": "Download an Air asset directly to a Drive folder",
