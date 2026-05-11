@@ -267,7 +267,7 @@ def make_external_reference(filename, asset_duration_seconds=600, ext="mp4"):
         # Normalise ext (strip leading dot if present, lowercase)
         clean_ext = (ext or "mp4").lower().lstrip(".")
         filename = f"{filename}.{clean_ext}"
-    target_url = f"./Footage/{filename}"
+    target_url = f"Footage/{filename}"
     available_range = TimeRange(
         start_time=RationalTime(0, FRAME_RATE),
         duration=seconds_to_rational_time(asset_duration_seconds),
@@ -283,7 +283,7 @@ def make_avatar_reference(total_duration):
         duration=seconds_to_rational_time(total_duration),
     )
     return otio.schema.ExternalReference(
-        target_url="./Footage/avatar.mp4", available_range=available_range,
+        target_url="Footage/avatar.mp4", available_range=available_range,
     )
 
 
@@ -302,7 +302,7 @@ def make_placeholder_clip(label, duration_seconds):
         duration=seconds_to_rational_time(duration_seconds),
     )
     media_ref = otio.schema.ExternalReference(
-        target_url=f"./Footage/_PLACEHOLDERS/{fake_filename}",
+        target_url=f"Footage/_PLACEHOLDERS/{fake_filename}",
         available_range=available_range,
     )
     return otio.schema.Clip(
@@ -787,7 +787,7 @@ def health():
         drive_ok = f"Error: {e}"
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v16-hook-bins-only",
+        "version": "v17-no-dot-slash-prefix",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
@@ -799,7 +799,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator + Asset Downloader",
-        "version": "v16",
+        "version": "v17",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes",
             "POST /download-to-drive": "Download an Air asset directly to a Drive folder",
