@@ -261,9 +261,12 @@ def seconds_to_rational_time(seconds, frame_rate=FRAME_RATE):
     return RationalTime(round(seconds * frame_rate), frame_rate)
 
 
-def make_external_reference(filename, asset_duration_seconds=600):
+def make_external_reference(filename, asset_duration_seconds=600, ext="mp4"):
+    # If filename doesn't already have a video extension, append the provided ext
     if not filename.lower().endswith((".mp4", ".mov", ".m4v")):
-        filename = filename + ".mp4"
+        # Normalise ext (strip leading dot if present, lowercase)
+        clean_ext = (ext or "mp4").lower().lstrip(".")
+        filename = f"{filename}.{clean_ext}"
     target_url = f"./Footage/{filename}"
     available_range = TimeRange(
         start_time=RationalTime(0, FRAME_RATE),
@@ -367,10 +370,11 @@ def build_track_for_outcomes(outcomes, asset_ids, segment_start, segment_end):
         clip_duration = seconds_to_rational_time(duration)
         if outcome_type == "match":
             filename = outcome.get("chosenFilename", "")
+            ext = outcome.get("chosenExt", "mp4")
             if filename:
                 clip = otio.schema.Clip(
                     name=filename,
-                    media_reference=make_external_reference(filename),
+                    media_reference=make_external_reference(filename, ext=ext),
                     source_range=TimeRange(
                         start_time=RationalTime(0, FRAME_RATE),
                         duration=clip_duration,
@@ -484,9 +488,10 @@ def build_concatenated_timeline(name, outcomes, video_type, segments):
             outcome_type = outcome.get("outcome")
             if outcome_type == "match":
                 filename = outcome.get("chosenFilename", "")
+                ext = outcome.get("chosenExt", "mp4")
                 if filename:
                     clip = otio.schema.Clip(
-                        name=filename, media_reference=make_external_reference(filename),
+                        name=filename, media_reference=make_external_reference(filename, ext=ext),
                         source_range=TimeRange(
                             start_time=RationalTime(0, FRAME_RATE),
                             duration=seconds_to_rational_time(duration),
@@ -614,23 +619,21 @@ def deduplicate_avatar_throughout(combined_xml):
 
 def wrap_in_bins(combined_xml):
     """
-    Wrap the project's sequences into Premiere bins for cleaner organization:
+    Organize the project into Premiere bins:
     
     [Project root]
-    ├── Hook V1/  → contains sequence -V1
-    ├── Hook V2/  → contains sequence -V2
-    ├── Hook V3/  → contains sequence -V3
-    ├── Hook V4/  → contains sequence -V4
-    ├── Hook V5/  → contains sequence -V5
+    ├── Hook V1/        → just the sequence -V1
+    ├── Hook V2/        → just the sequence -V2
+    ├── Hook V3/        → just the sequence -V3
+    ├── Hook V4/        → just the sequence -V4
+    ├── Hook V5/        → just the sequence -V5
+    ├── Footage/        → standalone <clip> entries for each unique footage file
+    └── Placeholders/   → standalone <clip> entries for each placeholder slug
     
-    Each sequence stays where it is in the XML — we just wrap each in a <bin>.
-    Premiere reads <bin> elements as folders in the Project panel.
-    
-    Notes:
-    - We don't add <bin>s for Footage/Placeholders. Premiere automatically
-      groups assets by their reference paths once the project loads,
-      and adding empty bins would just create empty folders.
-    - If there's only 1 sequence (single-sequence project), skip the binning.
+    The Footage and Placeholders bins contain <clip> elements that reference
+    the same file IDs as the sequences. Premiere reads these as "this media
+    item lives in this bin", overriding its default of placing media items
+    in the first sequence's parent bin.
     """
     sequence_blocks = list(re.finditer(
         r'(<sequence[^>]*>.*?</sequence>)',
@@ -641,15 +644,13 @@ def wrap_in_bins(combined_xml):
     if len(sequence_blocks) <= 1:
         return combined_xml
     
-    # Build new children with each sequence wrapped in a <bin>
+    # Wrap each sequence in its Hook bin
     bin_wrapped = []
     for i, m in enumerate(sequence_blocks, start=1):
         seq_xml = m.group(1)
-        # Extract the sequence name to use as bin name
         name_match = re.search(r'<sequence[^>]*>\s*<name>([^<]+)</name>', seq_xml)
         if name_match:
             seq_name = name_match.group(1)
-            # Try to extract just the variation suffix (e.g. "V1" from "GC-VID-C1-V1")
             var_match = re.search(r'-V(\d+)$', seq_name)
             bin_name = f"Hook V{var_match.group(1)}" if var_match else f"Variation {i}"
         else:
@@ -663,12 +664,74 @@ def wrap_in_bins(combined_xml):
             </bin>"""
         bin_wrapped.append(bin_xml)
     
-    # Replace the original sequences in the XML with the binned versions.
-    # Walk in reverse to keep byte offsets valid.
+    # Replace each sequence with its Hook bin (in reverse to keep offsets valid)
     result = combined_xml
     for m, new_bin in zip(reversed(sequence_blocks), reversed(bin_wrapped)):
         start, end = m.span(1)
         result = result[:start] + new_bin + result[end:]
+    
+    # Now collect unique media files from the XML to build Footage and Placeholders bins.
+    # We want each unique file referenced exactly once at the bin level.
+    
+    # Find all full <file> definitions (those with <pathurl>...)
+    file_def_pattern = re.compile(
+        r'<file id="(file-\d+)">\s*<pathurl>([^<]+)</pathurl>\s*<name>([^<]+)</name>.*?</file>',
+        re.DOTALL,
+    )
+    
+    footage_clips = []
+    placeholder_clips = []
+    
+    clip_id_counter = 9000
+    seen_keys = set()  # dedupe by (path) — same file in multiple sequences shows once
+    
+    for fm in file_def_pattern.finditer(result):
+        file_id = fm.group(1)
+        path = fm.group(2)
+        name = fm.group(3)
+        
+        # Dedupe by full path — multiple <file> definitions of the same clip
+        # (one per sequence after ID renumbering) collapse to a single bin entry
+        if path in seen_keys:
+            continue
+        seen_keys.add(path)
+        
+        clip_id_counter += 1
+        
+        clip_xml = f"""<clip id="bin-clip-{clip_id_counter}">
+                        <name>{name}</name>
+                        <file id="{file_id}"/>
+                    </clip>"""
+        
+        if "_PLACEHOLDERS/" in path:
+            placeholder_clips.append(clip_xml)
+        else:
+            footage_clips.append(clip_xml)
+    
+    # Build Footage and Placeholders bins (only if they have content)
+    extra_bins = []
+    if footage_clips:
+        footage_bin = f"""<bin>
+                <name>Footage</name>
+                <children>
+                    {"".join(footage_clips)}
+                </children>
+            </bin>"""
+        extra_bins.append(footage_bin)
+    
+    if placeholder_clips:
+        placeholder_bin = f"""<bin>
+                <name>Placeholders</name>
+                <children>
+                    {"".join(placeholder_clips)}
+                </children>
+            </bin>"""
+        extra_bins.append(placeholder_bin)
+    
+    # Insert Footage and Placeholders bins right before </children> of the project
+    if extra_bins:
+        extras_xml = "\n            " + "\n            ".join(extra_bins) + "\n        "
+        result = result.replace("</children>\n    </project>", extras_xml + "</children>\n    </project>")
     
     return result
 
@@ -779,7 +842,7 @@ def health():
         drive_ok = f"Error: {e}"
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v13-bins-and-avatar-path",
+        "version": "v15-explicit-bins",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
@@ -791,7 +854,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator + Asset Downloader",
-        "version": "v13",
+        "version": "v15",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes",
             "POST /download-to-drive": "Download an Air asset directly to a Drive folder",
