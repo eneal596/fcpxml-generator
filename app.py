@@ -280,7 +280,7 @@ def make_avatar_reference(total_duration):
         duration=seconds_to_rational_time(total_duration),
     )
     return otio.schema.ExternalReference(
-        target_url="./avatar.mp4", available_range=available_range,
+        target_url="./Footage/avatar.mp4", available_range=available_range,
     )
 
 
@@ -588,7 +588,7 @@ def inject_sequence_format_throughout(combined_xml, dimensions):
 
 def deduplicate_avatar_throughout(combined_xml):
     pattern = re.compile(
-        r'<file id="(file-\d+)">(\s*<pathurl>\./avatar\.mp4</pathurl>.*?)</file>',
+        r'<file id="(file-\d+)">(\s*<pathurl>\./Footage/avatar\.mp4</pathurl>.*?)</file>',
         re.DOTALL,
     )
     matches = list(pattern.finditer(combined_xml))
@@ -610,6 +610,67 @@ def deduplicate_avatar_throughout(combined_xml):
         return f'<file id="{canonical_id}"/>'
     combined_xml = re.sub(r'<file id="(file-\d+)"/>', fix_ref, combined_xml)
     return combined_xml
+
+
+def wrap_in_bins(combined_xml):
+    """
+    Wrap the project's sequences into Premiere bins for cleaner organization:
+    
+    [Project root]
+    ├── Hook V1/  → contains sequence -V1
+    ├── Hook V2/  → contains sequence -V2
+    ├── Hook V3/  → contains sequence -V3
+    ├── Hook V4/  → contains sequence -V4
+    ├── Hook V5/  → contains sequence -V5
+    
+    Each sequence stays where it is in the XML — we just wrap each in a <bin>.
+    Premiere reads <bin> elements as folders in the Project panel.
+    
+    Notes:
+    - We don't add <bin>s for Footage/Placeholders. Premiere automatically
+      groups assets by their reference paths once the project loads,
+      and adding empty bins would just create empty folders.
+    - If there's only 1 sequence (single-sequence project), skip the binning.
+    """
+    sequence_blocks = list(re.finditer(
+        r'(<sequence[^>]*>.*?</sequence>)',
+        combined_xml,
+        re.DOTALL,
+    ))
+    
+    if len(sequence_blocks) <= 1:
+        return combined_xml
+    
+    # Build new children with each sequence wrapped in a <bin>
+    bin_wrapped = []
+    for i, m in enumerate(sequence_blocks, start=1):
+        seq_xml = m.group(1)
+        # Extract the sequence name to use as bin name
+        name_match = re.search(r'<sequence[^>]*>\s*<name>([^<]+)</name>', seq_xml)
+        if name_match:
+            seq_name = name_match.group(1)
+            # Try to extract just the variation suffix (e.g. "V1" from "GC-VID-C1-V1")
+            var_match = re.search(r'-V(\d+)$', seq_name)
+            bin_name = f"Hook V{var_match.group(1)}" if var_match else f"Variation {i}"
+        else:
+            bin_name = f"Variation {i}"
+        
+        bin_xml = f"""<bin>
+                <name>{bin_name}</name>
+                <children>
+                    {seq_xml}
+                </children>
+            </bin>"""
+        bin_wrapped.append(bin_xml)
+    
+    # Replace the original sequences in the XML with the binned versions.
+    # Walk in reverse to keep byte offsets valid.
+    result = combined_xml
+    for m, new_bin in zip(reversed(sequence_blocks), reversed(bin_wrapped)):
+        start, end = m.span(1)
+        result = result[:start] + new_bin + result[end:]
+    
+    return result
 
 
 def build_combined_fcpxml(sequences_xml_list, project_name, dimensions):
@@ -648,6 +709,7 @@ def build_combined_fcpxml(sequences_xml_list, project_name, dimensions):
 """
     combined_xml = inject_sequence_format_throughout(combined_xml, dimensions)
     combined_xml = deduplicate_avatar_throughout(combined_xml)
+    combined_xml = wrap_in_bins(combined_xml)
     return combined_xml
 
 
@@ -717,7 +779,7 @@ def health():
         drive_ok = f"Error: {e}"
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v12-streamed-upload",
+        "version": "v13-bins-and-avatar-path",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
@@ -729,7 +791,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator + Asset Downloader",
-        "version": "v12",
+        "version": "v13",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes",
             "POST /download-to-drive": "Download an Air asset directly to a Drive folder",
