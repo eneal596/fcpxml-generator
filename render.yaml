@@ -3,5 +3,5 @@ services:
     name: fcpxml-generator
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app
+    startCommand: gunicorn main:app --timeout 300 --workers 1
     plan: free
