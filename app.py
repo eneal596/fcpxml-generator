@@ -152,7 +152,7 @@ def download_to_drive():
         resp = requests.get(
             url_endpoint,
             headers={
-                "Authorization": f"Bearer {air_key}",
+                "x-api-key": air_key,
                 "x-air-workspace-id": workspace_id,
             },
             timeout=30,
@@ -706,7 +706,7 @@ def health():
         drive_ok = f"Error: {e}"
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v10-with-workspace-header",
+        "version": "v11-fixed-air-auth",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
@@ -718,7 +718,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator + Asset Downloader",
-        "version": "v10",
+        "version": "v11",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes",
             "POST /download-to-drive": "Download an Air asset directly to a Drive folder",
