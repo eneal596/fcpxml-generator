@@ -22,7 +22,7 @@ from flask import Flask, request, jsonify
 import opentimelineio as otio
 from opentimelineio.opentime import RationalTime, TimeRange
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 import os
@@ -201,17 +201,28 @@ def download_to_drive():
                 if filename.lower().endswith((".mov", ".m4v")):
                     mime_type = "video/quicktime"
                 
-                with open(tmp_path, "rb") as fh:
-                    media = MediaIoBaseUpload(fh, mimetype=mime_type, resumable=False)
-                    metadata = {
-                        "name": filename,
-                        "parents": [drive_folder_id],
-                    }
-                    created = drive.files().create(
-                        body=metadata,
-                        media_body=media,
-                        fields="id,name",
-                    ).execute()
+                # MediaFileUpload with resumable=True streams the file from disk in 5MB
+                # chunks — keeps memory usage low regardless of file size.
+                media = MediaFileUpload(
+                    tmp_path,
+                    mimetype=mime_type,
+                    resumable=True,
+                    chunksize=5 * 1024 * 1024,  # 5MB chunks
+                )
+                metadata = {
+                    "name": filename,
+                    "parents": [drive_folder_id],
+                }
+                # Use a resumable upload, advancing chunk-by-chunk
+                request_obj = drive.files().create(
+                    body=metadata,
+                    media_body=media,
+                    fields="id,name",
+                )
+                response = None
+                while response is None:
+                    status, response = request_obj.next_chunk()
+                created = response
                 
                 return jsonify({
                     "ok": True,
@@ -706,7 +717,7 @@ def health():
         drive_ok = f"Error: {e}"
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v11-fixed-air-auth",
+        "version": "v12-streamed-upload",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
@@ -718,7 +729,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator + Asset Downloader",
-        "version": "v11",
+        "version": "v12",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes",
             "POST /download-to-drive": "Download an Air asset directly to a Drive folder",
