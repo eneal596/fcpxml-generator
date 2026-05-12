@@ -1091,7 +1091,7 @@ def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
         f"format=yuva444p10le"
     )
 
-cmd = [
+    cmd = [
         "ffmpeg", "-y",
         "-hide_banner",
         "-loglevel", "error",
@@ -1290,7 +1290,7 @@ def health():
     font_file = BUNDLED_FONTS_DIR / CAPTION_STYLE_DEFAULTS["fontFile"]
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v19-captions-alpha-fix",
+        "version": "v20-explicit-rgba-source",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
