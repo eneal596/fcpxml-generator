@@ -1083,11 +1083,15 @@ def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
     ass_escaped = _escape_filter_path(ass_abs)
     fonts_escaped = _escape_filter_path(fonts_dir)
 
+    # v21: libass with alpha=1 has been unreliable in our FFmpeg build —
+    # the output keeps coming back fully opaque despite yuva pix_fmt.
+    # Switching to a chroma-key approach: render text on bright magenta
+    # (a color that will never appear in Komika Axis white/red captions),
+    # then key it out with colorkey. Reliable and predictable.
     vf = (
-        f"format=rgba,"
         f"subtitles=filename='{ass_escaped}'"
-        f":fontsdir='{fonts_escaped}'"
-        f":alpha=1,"
+        f":fontsdir='{fonts_escaped}',"
+        f"colorkey=color=0xFF00FF:similarity=0.01:blend=0.0,"
         f"format=yuva444p10le"
     )
 
@@ -1096,7 +1100,7 @@ def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
         "-hide_banner",
         "-loglevel", "error",
         "-f", "lavfi",
-        "-i", f"color=c=0x00000000:s={width}x{height}:r={fps}:d={duration:.2f}",
+        "-i", f"color=c=0xFF00FF:s={width}x{height}:r={fps}:d={duration:.2f}",
         "-vf", vf,
         "-c:v", "prores_ks",
         "-profile:v", "4444",
@@ -1290,7 +1294,7 @@ def health():
     font_file = BUNDLED_FONTS_DIR / CAPTION_STYLE_DEFAULTS["fontFile"]
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v20-explicit-rgba-source",
+        "version": "v21-chromakey-alpha",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
