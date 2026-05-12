@@ -1,5 +1,14 @@
 """
-FCPXML Generator + Asset Downloader + Caption Generator service - v18.
+FCPXML Generator + Asset Downloader + Caption Generator service - v19.
+
+v19 changes:
+  - Fix alpha channel in captions.mov. The color=c=black@0.0 lavfi source
+    defaults to yuv420p (no alpha), so libass composited subtitles onto an
+    opaque canvas. Final yuva444p10le conversion then filled alpha with 100%
+    opaque values — file had alpha metadata but every pixel was fully opaque,
+    rendering as black in Premiere.
+    Fix: prepend format=rgba to the filter chain so the canvas carries alpha
+    from the start, and append format=yuva444p10le before the encoder.
 
 v18 changes:
   - NEW /generate-captions endpoint:
@@ -22,9 +31,9 @@ System requirements:
   fonts/KomikaAxis.ttf bundled in repo
 
 Endpoints:
-  POST /generate              — generate FCPXML (now caption-aware)
+  POST /generate              — generate FCPXML (caption-aware)
   POST /download-to-drive     — download a single Air asset to a Drive folder
-  POST /generate-captions     — NEW: build ASS + render alpha-channel captions.mov
+  POST /generate-captions     — build ASS + render alpha-channel captions.mov
   GET  /health                — health check
 """
 
@@ -117,7 +126,7 @@ def download_to_drive():
         "driveFolderId": "drive-folder-id",
         "skipIfExists": true
       }
-    
+
     Returns:
       Success: { "ok": true, "driveFileId": "...", "filename": "...", "bytesUploaded": N }
       Skipped: { "ok": true, "skipped": true, "reason": "..." }
@@ -130,15 +139,15 @@ def download_to_drive():
         filename = data.get("filename")
         drive_folder_id = data.get("driveFolderId")
         skip_if_exists = data.get("skipIfExists", True)
-        
+
         if not all([asset_id, version_id, filename, drive_folder_id]):
             return jsonify({
                 "ok": False,
                 "error": "Missing required field. Need: assetId, versionId, filename, driveFolderId"
             }), 400
-        
+
         drive = get_drive_service()
-        
+
         # Optionally skip if file already exists in folder
         if skip_if_exists:
             q = f"name = '{filename.replace(chr(39), chr(92)+chr(39))}' and '{drive_folder_id}' in parents and trashed = false"
@@ -151,16 +160,16 @@ def download_to_drive():
                     "driveFileId": existing["files"][0]["id"],
                     "filename": filename
                 })
-        
+
         # Step 1: ask Air for the actual download URL
         air_key = os.environ.get("AIR_API_KEY")
         if not air_key:
             return jsonify({"ok": False, "error": "AIR_API_KEY env var not set"}), 500
-        
+
         workspace_id = os.environ.get("AIR_WORKSPACE_ID")
         if not workspace_id:
             return jsonify({"ok": False, "error": "AIR_WORKSPACE_ID env var not set"}), 500
-        
+
         url_endpoint = f"{AIR_API_BASE}/assets/{asset_id}/versions/{version_id}/download"
         resp = requests.get(
             url_endpoint,
@@ -171,7 +180,7 @@ def download_to_drive():
             timeout=30,
             allow_redirects=False,
         )
-        
+
         download_url = None
         if 300 <= resp.status_code < 400 and resp.headers.get("location"):
             download_url = resp.headers["location"]
@@ -182,13 +191,13 @@ def download_to_drive():
             except Exception:
                 if resp.text.startswith("http"):
                     download_url = resp.text.strip()
-        
+
         if not download_url:
             return jsonify({
                 "ok": False,
                 "error": f"Could not extract download URL from Air. Status: {resp.status_code}. Body: {resp.text[:300]}"
             }), 500
-        
+
         # Step 2: stream the file from Air → Drive, in chunks, never holding full bytes
         # Use requests.get(stream=True) and feed to a generator-backed BytesIO
         with requests.get(download_url, stream=True, timeout=300) as file_resp:
@@ -197,7 +206,7 @@ def download_to_drive():
                     "ok": False,
                     "error": f"Failed to download from Air-provided URL. Status: {file_resp.status_code}"
                 }), 500
-            
+
             # Write to a tempfile so MediaIoBaseUpload can stream it to Drive
             # Tempfile is on Render disk (separate from n8n), and we delete it after
             with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
@@ -207,13 +216,13 @@ def download_to_drive():
                     if chunk:
                         tmp.write(chunk)
                         bytes_total += len(chunk)
-            
+
             try:
                 # Determine MIME type from filename extension
                 mime_type = "video/mp4"
                 if filename.lower().endswith((".mov", ".m4v")):
                     mime_type = "video/quicktime"
-                
+
                 # MediaFileUpload with resumable=True streams the file from disk in 5MB
                 # chunks — keeps memory usage low regardless of file size.
                 media = MediaFileUpload(
@@ -236,7 +245,7 @@ def download_to_drive():
                 while response is None:
                     status, response = request_obj.next_chunk()
                 created = response
-                
+
                 return jsonify({
                     "ok": True,
                     "driveFileId": created.get("id"),
@@ -248,7 +257,7 @@ def download_to_drive():
                     os.unlink(tmp_path)
                 except Exception:
                     pass
-    
+
     except Exception as e:
         return jsonify({
             "ok": False,
@@ -682,7 +691,7 @@ def deduplicate_avatar_throughout(combined_xml):
 def wrap_in_bins(combined_xml):
     """
     Organize the project into Premiere bins:
-    
+
     [Project root]
     ├── Hook V1/        → just the sequence -V1
     ├── Hook V2/        → just the sequence -V2
@@ -691,7 +700,7 @@ def wrap_in_bins(combined_xml):
     ├── Hook V5/        → just the sequence -V5
     ├── Footage/        → standalone <clip> entries for each unique footage file
     └── Placeholders/   → standalone <clip> entries for each placeholder slug
-    
+
     The Footage and Placeholders bins contain <clip> elements that reference
     the same file IDs as the sequences. Premiere reads these as "this media
     item lives in this bin", overriding its default of placing media items
@@ -702,10 +711,10 @@ def wrap_in_bins(combined_xml):
         combined_xml,
         re.DOTALL,
     ))
-    
+
     if len(sequence_blocks) <= 1:
         return combined_xml
-    
+
     # Wrap each sequence in its Hook bin
     bin_wrapped = []
     for i, m in enumerate(sequence_blocks, start=1):
@@ -717,7 +726,7 @@ def wrap_in_bins(combined_xml):
             bin_name = f"Hook V{var_match.group(1)}" if var_match else f"Variation {i}"
         else:
             bin_name = f"Variation {i}"
-        
+
         bin_xml = f"""<bin>
                 <name>{bin_name}</name>
                 <children>
@@ -725,21 +734,21 @@ def wrap_in_bins(combined_xml):
                 </children>
             </bin>"""
         bin_wrapped.append(bin_xml)
-    
+
     # Replace each sequence with its Hook bin (in reverse to keep offsets valid)
     result = combined_xml
     for m, new_bin in zip(reversed(sequence_blocks), reversed(bin_wrapped)):
         start, end = m.span(1)
         result = result[:start] + new_bin + result[end:]
-    
+
     # Note: previous versions tried to add explicit Footage/Placeholders bins
     # using bare <file id=".."/> references, but FCP7 XML requires standalone
     # <clip> elements in bins to have their own full <file> definition with
     # <pathurl> etc. Bare references caused Premiere import failures.
-    # 
+    #
     # For now we only wrap sequences in Hook bins. Premiere will auto-place
     # the media items somewhere on import, which the editor can rearrange.
-    
+
     return result
 
 
@@ -845,7 +854,7 @@ def generate():
 
 
 # ============================================================================
-# Caption generation — NEW in v18
+# Caption generation
 # ============================================================================
 
 # Hardcoded MrBeast-style defaults. Move to per-client lookup later.
@@ -1044,8 +1053,14 @@ def _build_ass(aligned_beats, style=None):
 
 def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
     """
-    Run FFmpeg to render the ASS file onto a transparent canvas, producing a
-    1080×1920 ProRes 4444 .mov with alpha channel.
+    Render ASS subtitles to a 1080×1920 ProRes 4444 .mov with true alpha channel.
+
+    v19 fix: color=c=black@0.0 lavfi source defaults to yuv420p (no alpha), so
+    libass composited subtitles onto an opaque canvas. Final yuva conversion
+    filled alpha with 100% opaque values — file had alpha metadata but every
+    pixel was fully opaque, rendering as black in Premiere.
+    Now: prepend format=rgba so the canvas carries alpha from the start, then
+    append format=yuva444p10le right before the encoder.
 
     Streams FFmpeg stderr line-by-line into a bounded ring buffer instead of
     using capture_output=True, which buffers everything in RAM and OOMs on
@@ -1069,9 +1084,11 @@ def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
     fonts_escaped = _escape_filter_path(fonts_dir)
 
     vf = (
+        f"format=rgba,"
         f"subtitles=filename='{ass_escaped}'"
         f":fontsdir='{fonts_escaped}'"
-        f":alpha=1"
+        f":alpha=1,"
+        f"format=yuva444p10le"
     )
 
     cmd = [
@@ -1272,7 +1289,7 @@ def health():
     font_file = BUNDLED_FONTS_DIR / CAPTION_STYLE_DEFAULTS["fontFile"]
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v18-captions",
+        "version": "v19-captions-alpha-fix",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
@@ -1286,7 +1303,7 @@ def health():
 def root():
     return jsonify({
         "service": "FCPXML Generator + Asset Downloader + Caption Generator",
-        "version": "v18",
+        "version": "v19",
         "endpoints": {
             "POST /generate": "Generate FCPXML from beat outcomes (now accepts captionsFilename)",
             "POST /download-to-drive": "Download an Air asset directly to a Drive folder",
