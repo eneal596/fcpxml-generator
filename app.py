@@ -873,6 +873,12 @@ CAPTION_STYLE_DEFAULTS = {
     "marginL": 60,
     "marginR": 60,
     "wordsPerWindow": 3,               # how many words on screen at once
+    # Rough horizontal-width budget. Komika Axis at fs=130 with 8px outline is
+    # wide; we estimate ~75px per character + 35px per inter-word space and use
+    # this as a max to decide whether a 3-word window must be split to 2 words.
+    "maxWindowWidthPx": 960,           # videoWidth - marginL - marginR
+    "estCharWidthPx": 75,
+    "estSpaceWidthPx": 35,
     "videoWidth": 1080,
     "videoHeight": 1920,
     "frameRate": 30,
@@ -952,18 +958,48 @@ def _collect_caption_words(aligned_beats):
     return caption_words
 
 
-def _group_words_into_windows(words, words_per_window, max_gap=1.5):
+def _estimate_window_width(window_words, cfg):
+    """
+    Rough width estimate of a window when rendered. We use the highlight font
+    size (the larger one) for whichever word is active, but to keep this
+    cheap we just assume the widest case: every word at highlight size, plus
+    spaces between them. This over-estimates slightly, which is what we want
+    — better to split a borderline 3-word window into 2+1 than overflow.
+    """
+    if not window_words:
+        return 0
+    char_total = sum(len(w["display"]) for w in window_words)
+    spaces = max(0, len(window_words) - 1)
+    # Scale char width by the size ratio so the estimate tracks both base and
+    # highlight sizes proportionally.
+    size_ratio = cfg["highlightFontSize"] / cfg["baseFontSize"]
+    return int(char_total * cfg["estCharWidthPx"] * size_ratio + spaces * cfg["estSpaceWidthPx"])
+
+
+def _group_words_into_windows(words, cfg, max_gap=1.5):
     """
     Group consecutive words into on-screen 'windows'. Start a new window when
-    (a) window is full, (b) a sentence-ending word is hit, or (c) there's a
-    large time gap to the next word.
+    (a) window is at the soft-cap (wordsPerWindow), (b) a sentence-ending
+    word is hit, (c) there's a large time gap to the next word, or
+    (d) adding the next word would push the rendered width past maxWindowWidthPx.
+
+    The width check is what guarantees we never overflow the frame: a 3-word
+    window of long words gets split into 2+1, etc.
     """
     if not words:
         return []
+    words_per_window = cfg["wordsPerWindow"]
+    max_width = cfg["maxWindowWidthPx"]
     groups = []
     current = []
     for i, w in enumerate(words):
-        current.append(w)
+        # Try to add w to current. If that would overflow on width, flush first.
+        prospective = current + [w]
+        if current and _estimate_window_width(prospective, cfg) > max_width:
+            groups.append(current)
+            current = [w]
+        else:
+            current.append(w)
         ends_sentence = w["display"].rstrip().endswith((".", "?", "!"))
         is_full = len(current) >= words_per_window
         is_last = i == len(words) - 1
@@ -1017,17 +1053,27 @@ def _build_ass(aligned_beats, style=None):
         # No captions — return a valid but empty ASS (renders to fully transparent video).
         return header
 
-    windows = _group_words_into_windows(words, cfg["wordsPerWindow"])
+    windows = _group_words_into_windows(words, cfg)
+    # Pre-compute each window's [start, end] and clamp end to the next window's
+    # start. Without this, a window whose last word's `end` overruns the next
+    # window's first word's `start` (very common — Whisper word boundaries are
+    # loose) causes two events to render simultaneously: the old window stays
+    # on screen at its position while the new one appears below it.
+    window_bounds = []
+    for w_idx, window in enumerate(windows):
+        ws = window[0]["start"]
+        we = window[-1]["end"]
+        if w_idx + 1 < len(windows):
+            next_start = windows[w_idx + 1][0]["start"]
+            if we > next_start:
+                we = next_start
+        if we <= ws:
+            we = ws + 0.05
+        window_bounds.append((ws, we))
+
     dialogue_lines = []
-    for window in windows:
-        # Each event for this window spans from the window's first word start
-        # to the last word's end. Keeping the line on screen continuously
-        # prevents the one-frame flash between words and any momentary
-        # re-layout that can briefly wrap text to two lines.
-        window_start = window[0]["start"]
-        window_end = window[-1]["end"]
-        if window_end <= window_start:
-            window_end = window_start + 0.05
+    for w_idx, window in enumerate(windows):
+        window_start, window_end = window_bounds[w_idx]
         for idx, active in enumerate(window):
             parts = []
             for j, w in enumerate(window):
@@ -1043,12 +1089,12 @@ def _build_ass(aligned_beats, style=None):
                     parts.append(w["display"])
             text = "".join(parts)
             # Each word's event covers from when it becomes active until the
-            # next word becomes active (or window end for the last word).
-            # All events run inside [window_start, window_end] so the line
-            # is on screen continuously; the active-word highlight just shifts.
-            event_start = active["start"]
+            # next word becomes active (or window_end for the last word).
+            # All events stay inside [window_start, window_end] so the line
+            # is on screen continuously without overlapping the next window.
+            event_start = max(active["start"], window_start)
             if idx + 1 < len(window):
-                event_end = window[idx + 1]["start"]
+                event_end = min(window[idx + 1]["start"], window_end)
             else:
                 event_end = window_end
             if event_end <= event_start:
@@ -1309,7 +1355,7 @@ def health():
     font_file = BUNDLED_FONTS_DIR / CAPTION_STYLE_DEFAULTS["fontFile"]
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v22-no-wrap-continuous-events",
+        "version": "v23-width-aware-clamped",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
