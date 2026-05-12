@@ -1091,17 +1091,18 @@ def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
         f"format=yuva444p10le"
     )
 
-    cmd = [
+cmd = [
         "ffmpeg", "-y",
         "-hide_banner",
         "-loglevel", "error",
         "-f", "lavfi",
-        "-i", f"color=c=black@0.0:s={width}x{height}:r={fps}:d={duration:.2f}",
+        "-i", f"color=c=0x00000000:s={width}x{height}:r={fps}:d={duration:.2f}",
         "-vf", vf,
         "-c:v", "prores_ks",
         "-profile:v", "4444",
         "-pix_fmt", "yuva444p10le",
         "-an",
+        "-alpha_bits", "16",
         mov_path,
     ]
 
