@@ -994,7 +994,7 @@ def _build_ass(aligned_beats, style=None):
         "ScriptType: v4.00+\n"
         f"PlayResX: {cfg['videoWidth']}\n"
         f"PlayResY: {cfg['videoHeight']}\n"
-        "WrapStyle: 0\n"
+        "WrapStyle: 2\n"
         "ScaledBorderAndShadow: yes\n"
         "\n"
         "[V4+ Styles]\n"
@@ -1020,6 +1020,14 @@ def _build_ass(aligned_beats, style=None):
     windows = _group_words_into_windows(words, cfg["wordsPerWindow"])
     dialogue_lines = []
     for window in windows:
+        # Each event for this window spans from the window's first word start
+        # to the last word's end. Keeping the line on screen continuously
+        # prevents the one-frame flash between words and any momentary
+        # re-layout that can briefly wrap text to two lines.
+        window_start = window[0]["start"]
+        window_end = window[-1]["end"]
+        if window_end <= window_start:
+            window_end = window_start + 0.05
         for idx, active in enumerate(window):
             parts = []
             for j, w in enumerate(window):
@@ -1034,12 +1042,19 @@ def _build_ass(aligned_beats, style=None):
                 else:
                     parts.append(w["display"])
             text = "".join(parts)
-            start_t = active["start"]
-            end_t = active["end"]
-            if end_t <= start_t:
-                end_t = start_t + 0.05
+            # Each word's event covers from when it becomes active until the
+            # next word becomes active (or window end for the last word).
+            # All events run inside [window_start, window_end] so the line
+            # is on screen continuously; the active-word highlight just shifts.
+            event_start = active["start"]
+            if idx + 1 < len(window):
+                event_end = window[idx + 1]["start"]
+            else:
+                event_end = window_end
+            if event_end <= event_start:
+                event_end = event_start + 0.05
             dialogue_lines.append(
-                f"Dialogue: 0,{_format_ass_time(start_t)},{_format_ass_time(end_t)},"
+                f"Dialogue: 0,{_format_ass_time(event_start)},{_format_ass_time(event_end)},"
                 f"Default,,0,0,0,,{text}"
             )
 
@@ -1294,7 +1309,7 @@ def health():
     font_file = BUNDLED_FONTS_DIR / CAPTION_STYLE_DEFAULTS["fontFile"]
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v21-chromakey-alpha",
+        "version": "v22-no-wrap-continuous-events",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
