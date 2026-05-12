@@ -874,11 +874,26 @@ CAPTION_STYLE_DEFAULTS = {
     "marginR": 60,
     "wordsPerWindow": 3,               # how many words on screen at once
     # Rough horizontal-width budget. Komika Axis at fs=130 with 8px outline is
-    # wide; we estimate ~75px per character + 35px per inter-word space and use
-    # this as a max to decide whether a 3-word window must be split to 2 words.
-    "maxWindowWidthPx": 960,           # videoWidth - marginL - marginR
-    "estCharWidthPx": 75,
-    "estSpaceWidthPx": 35,
+    # wide; we estimate per-char width + per-space width, scaled by the highlight
+    # size ratio, and use this as a hard max. The 880px budget (vs 960 video
+    # width minus margins) gives ~80px of safety margin so the layout can never
+    # be ambiguous enough to trigger a second-line wrap.
+    "maxWindowWidthPx": 880,
+    "estCharWidthPx": 85,
+    "estSpaceWidthPx": 40,
+    # Natural timing controls (v24).
+    # silentGapThreshold: if the gap between consecutive words exceeds this
+    # many seconds, let the screen go empty during the gap instead of holding
+    # the previous word. Tune up for more "breathing room", down to keep the
+    # line on screen more continuously.
+    "silentGapThreshold": 0.4,
+    # Max time a window's last word lingers on screen after it's been said.
+    # Capped by the next window's start regardless.
+    "maxHoldAfterLastWord": 0.6,
+    # Word-appear stretch animation duration (ms). Each highlighted word
+    # scales from 80% to 100% over this many ms when it becomes active —
+    # gives an AE-like pop. Set to 0 to disable.
+    "highlightStretchMs": 120,
     "videoWidth": 1080,
     "videoHeight": 1920,
     "frameRate": 30,
@@ -906,12 +921,87 @@ def _strip_ass_unsafe(text):
     return text.replace("{", "(").replace("}", ")")
 
 
+def _normalize_for_match(s):
+    """Lowercase + strip punctuation for token matching."""
+    return re.sub(r"[^\w]", "", s).lower()
+
+
+def _align_script_to_whisper(script_tokens, whisper_words):
+    """
+    Match each script token to a whisper word so each script token gets the
+    whisper word's actual start/end time, not a linearly-distributed slice.
+
+    Uses difflib.SequenceMatcher on the normalised token strings. Returns a
+    list the same length as script_tokens, where each entry is either the
+    matched whisper_word dict, or None if no good match was found.
+
+    When too few matches are found (mismatch ratio > 40%), returns None so
+    the caller falls back to linear distribution — the safer behaviour when
+    Whisper drops/adds words substantially.
+    """
+    from difflib import SequenceMatcher
+    if not script_tokens or not whisper_words:
+        return None
+    script_norm = [_normalize_for_match(t) for t in script_tokens]
+    whisper_norm = [_normalize_for_match(w.get("word", "")) for w in whisper_words]
+    matcher = SequenceMatcher(a=script_norm, b=whisper_norm, autojunk=False)
+    matches = [None] * len(script_tokens)
+    matched_count = 0
+    for block in matcher.get_matching_blocks():
+        # block.size==0 marks the end sentinel; skip.
+        if block.size == 0:
+            continue
+        for k in range(block.size):
+            i = block.a + k  # script index
+            j = block.b + k  # whisper index
+            matches[i] = whisper_words[j]
+            matched_count += 1
+    # If too many script tokens didn't get matched, signal a fallback.
+    if matched_count < len(script_tokens) * 0.6:
+        return None
+    # Fill unmatched script tokens by interpolating from neighbours so they
+    # still have plausible timestamps. Walk forward then back.
+    for i in range(len(matches)):
+        if matches[i] is not None:
+            continue
+        # Find nearest matched neighbours on either side.
+        prev_idx = i - 1
+        while prev_idx >= 0 and matches[prev_idx] is None:
+            prev_idx -= 1
+        next_idx = i + 1
+        while next_idx < len(matches) and matches[next_idx] is None:
+            next_idx += 1
+        if prev_idx >= 0 and next_idx < len(matches):
+            # Interpolate between the two matched neighbours.
+            t_prev = float(matches[prev_idx]["end"])
+            t_next = float(matches[next_idx]["start"])
+            gap_count = next_idx - prev_idx
+            local_offset = i - prev_idx
+            t_start = t_prev + (t_next - t_prev) * (local_offset - 1) / gap_count
+            t_end = t_prev + (t_next - t_prev) * local_offset / gap_count
+            matches[i] = {"word": script_tokens[i], "start": t_start, "end": t_end}
+        elif prev_idx >= 0:
+            # Tail of script with no later match — chain off previous.
+            t_prev = float(matches[prev_idx]["end"])
+            matches[i] = {"word": script_tokens[i], "start": t_prev, "end": t_prev + 0.2}
+        elif next_idx < len(matches):
+            t_next = float(matches[next_idx]["start"])
+            matches[i] = {"word": script_tokens[i], "start": max(0, t_next - 0.2), "end": t_next}
+        else:
+            # No matches at all — shouldn't happen given the matched_count guard.
+            return None
+    return matches
+
+
 def _collect_caption_words(aligned_beats):
     """
-    Flatten aligned beats into a single list of caption word records. We pair each
-    Whisper-timed word with the corresponding script-text word so the displayed
-    caption uses the script's spelling (NUHR, Soul Analyse, etc.) but the timing
-    is Whisper's. Beats with no usable alignment are skipped.
+    Flatten aligned beats into a single list of caption word records. We pair
+    each script-text word with its actual Whisper timestamp (when alignment
+    succeeds) so the displayed caption uses the script's spelling but the
+    timing tracks what was actually said.
+
+    Falls back to linear distribution across the beat's Whisper span when
+    fuzzy alignment is too weak.
 
     Returns a list of dicts: { display, start, end }.
     """
@@ -923,15 +1013,10 @@ def _collect_caption_words(aligned_beats):
         narrated = (beat.get("narratedCopy") or "").strip()
         if not narrated:
             continue
-        # Tokenise the script text. Keep tokens with original casing/punctuation
-        # for display, but use a normalised form for length comparison.
         script_tokens = [t for t in narrated.split() if t]
         if not script_tokens:
             continue
-        # If script and whisper lengths match exactly, zip 1:1 (best case).
-        # Otherwise distribute evenly: take whisper as the timing skeleton and
-        # apportion script tokens across it. Mismatches are common because Whisper
-        # may split contractions differently or drop fillers.
+        # Best case — counts match, zip 1:1.
         if len(script_tokens) == len(whisper_words):
             for tok, ww in zip(script_tokens, whisper_words):
                 caption_words.append({
@@ -939,22 +1024,30 @@ def _collect_caption_words(aligned_beats):
                     "start": float(ww["start"]),
                     "end": float(ww["end"]),
                 })
-        else:
-            # Linearly map script tokens onto whisper timing.
-            n_script = len(script_tokens)
-            n_whisper = len(whisper_words)
-            t_start = float(whisper_words[0]["start"])
-            t_end = float(whisper_words[-1]["end"])
-            total = max(t_end - t_start, 1e-3)
-            for i, tok in enumerate(script_tokens):
-                # Each script token gets an even slice of the beat's whisper span.
-                frac_a = i / n_script
-                frac_b = (i + 1) / n_script
+            continue
+        # Counts mismatch — try fuzzy alignment first.
+        aligned = _align_script_to_whisper(script_tokens, whisper_words)
+        if aligned is not None:
+            for tok, ww in zip(script_tokens, aligned):
                 caption_words.append({
                     "display": _strip_ass_unsafe(tok),
-                    "start": t_start + frac_a * total,
-                    "end": t_start + frac_b * total,
+                    "start": float(ww["start"]),
+                    "end": float(ww["end"]),
                 })
+            continue
+        # Fallback — linear distribution across the beat's whisper span.
+        n_script = len(script_tokens)
+        t_start = float(whisper_words[0]["start"])
+        t_end = float(whisper_words[-1]["end"])
+        total = max(t_end - t_start, 1e-3)
+        for i, tok in enumerate(script_tokens):
+            frac_a = i / n_script
+            frac_b = (i + 1) / n_script
+            caption_words.append({
+                "display": _strip_ass_unsafe(tok),
+                "start": t_start + frac_a * total,
+                "end": t_start + frac_b * total,
+            })
     return caption_words
 
 
@@ -1054,49 +1147,74 @@ def _build_ass(aligned_beats, style=None):
         return header
 
     windows = _group_words_into_windows(words, cfg)
-    # Pre-compute each window's [start, end] and clamp end to the next window's
-    # start. Without this, a window whose last word's `end` overruns the next
-    # window's first word's `start` (very common — Whisper word boundaries are
-    # loose) causes two events to render simultaneously: the old window stays
-    # on screen at its position while the new one appears below it.
-    window_bounds = []
-    for w_idx, window in enumerate(windows):
-        ws = window[0]["start"]
-        we = window[-1]["end"]
-        if w_idx + 1 < len(windows):
-            next_start = windows[w_idx + 1][0]["start"]
-            if we > next_start:
-                we = next_start
-        if we <= ws:
-            we = ws + 0.05
-        window_bounds.append((ws, we))
+    # Pre-compute each window's bounds. window_end is now "soft" — we let the
+    # last word stay on screen up to maxHoldAfterLastWord seconds, but never
+    # past the next window's first word start.
+    max_hold = cfg["maxHoldAfterLastWord"]
+    silent_gap_threshold = cfg["silentGapThreshold"]
+    stretch_ms = cfg["highlightStretchMs"]
 
     dialogue_lines = []
     for w_idx, window in enumerate(windows):
-        window_start, window_end = window_bounds[w_idx]
+        # Determine when this window must release the screen at the latest.
+        if w_idx + 1 < len(windows):
+            next_window_start = windows[w_idx + 1][0]["start"]
+        else:
+            next_window_start = window[-1]["end"] + max_hold
+
         for idx, active in enumerate(window):
             parts = []
             for j, w in enumerate(window):
                 if j > 0:
                     parts.append(" ")
                 if j == idx:
+                    # Highlight + stretch animation. Start scale at 90% (not
+                    # lower) because a bigger initial size mismatch can cause
+                    # libass to re-layout the line during the animation and
+                    # briefly wrap to two rows. 90→100 is small enough to feel
+                    # like a pop but not shift the layout.
                     parts.append(
-                        f"{{\\fs{cfg['highlightFontSize']}\\c&H{cfg['highlightColor']}&}}"
+                        f"{{"
+                        f"\\fs{cfg['highlightFontSize']}"
+                        f"\\c&H{cfg['highlightColor']}&"
+                        f"\\fscx90\\fscy90"
+                        f"\\t(0,{stretch_ms},\\fscx100\\fscy100)"
+                        f"}}"
                         f"{w['display']}"
                         f"{{\\r}}"
                     )
                 else:
                     parts.append(w["display"])
             text = "".join(parts)
-            # Each word's event covers from when it becomes active until the
-            # next word becomes active (or window_end for the last word).
-            # All events stay inside [window_start, window_end] so the line
-            # is on screen continuously without overlapping the next window.
-            event_start = max(active["start"], window_start)
+
+            # Event-start: when this word becomes active (its spoken start).
+            event_start = active["start"]
+
+            # Event-end logic:
+            # - If there's another word in this window, end when that next word
+            #   becomes active. UNLESS there's a long silent gap, in which case
+            #   end at this word's spoken `end` and let the screen go empty
+            #   until the next word's start.
+            # - If this is the last word in the window, hold up to max_hold
+            #   seconds OR until the next window starts, whichever is first.
+            #   Also respect silent_gap_threshold to the next window.
             if idx + 1 < len(window):
-                event_end = min(window[idx + 1]["start"], window_end)
+                next_word_start = window[idx + 1]["start"]
+                gap = next_word_start - active["end"]
+                if gap > silent_gap_threshold:
+                    event_end = active["end"]
+                else:
+                    event_end = next_word_start
             else:
-                event_end = window_end
+                gap_to_next_window = next_window_start - active["end"]
+                hold = min(max_hold, max(0, gap_to_next_window))
+                if gap_to_next_window > silent_gap_threshold:
+                    # Pause long enough to feel like a beat — release after
+                    # the word's spoken end, leaving silent screen until next.
+                    event_end = active["end"] + min(0.15, hold)
+                else:
+                    event_end = active["end"] + hold
+
             if event_end <= event_start:
                 event_end = event_start + 0.05
             dialogue_lines.append(
@@ -1355,7 +1473,7 @@ def health():
     font_file = BUNDLED_FONTS_DIR / CAPTION_STYLE_DEFAULTS["fontFile"]
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v23-width-aware-clamped",
+        "version": "v25-wrap-safety",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
