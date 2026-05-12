@@ -1046,19 +1046,22 @@ def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
     """
     Run FFmpeg to render the ASS file onto a transparent canvas, producing a
     1080×1920 ProRes 4444 .mov with alpha channel.
+
+    Streams FFmpeg stderr line-by-line into a bounded ring buffer instead of
+    using capture_output=True, which buffers everything in RAM and OOMs on
+    long renders.
     """
+    import collections
+
     cfg = {**CAPTION_STYLE_DEFAULTS, **(style or {})}
     width = cfg["videoWidth"]
     height = cfg["videoHeight"]
     fps = cfg["frameRate"]
-    # Pad slightly to make sure final word fully renders.
     duration = max(duration_seconds + 0.5, 1.0)
 
-    # libass needs an absolute path or a path it can resolve. Use absolute to be safe.
     ass_abs = os.path.abspath(ass_path)
     fonts_dir = str(BUNDLED_FONTS_DIR.resolve())
 
-    # Escape characters that FFmpeg's filtergraph parser treats specially.
     def _escape_filter_path(p):
         return p.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
@@ -1073,6 +1076,8 @@ def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
 
     cmd = [
         "ffmpeg", "-y",
+        "-hide_banner",
+        "-loglevel", "error",
         "-f", "lavfi",
         "-i", f"color=c=black@0.0:s={width}x{height}:r={fps}:d={duration:.2f}",
         "-vf", vf,
@@ -1083,10 +1088,26 @@ def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
         mov_path,
     ]
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=480)
+    stderr_tail_buf = collections.deque(maxlen=200)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    try:
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_tail_buf.append(line)
+        proc.wait(timeout=480)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+
     if proc.returncode != 0:
-        # Surface the last ~1500 chars of FFmpeg stderr so n8n can see what failed.
-        stderr_tail = (proc.stderr or "")[-1500:]
+        stderr_tail = "".join(stderr_tail_buf)[-1500:]
         raise RuntimeError(
             f"FFmpeg failed (exit {proc.returncode}). Tail: {stderr_tail}"
         )
