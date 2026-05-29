@@ -3,5 +3,5 @@ services:
     name: fcpxml-generator
     runtime: python
     buildCommand: apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt
-    startCommand: gunicorn app:app --timeout 600 --workers 1
+    startCommand: gunicorn app:app --timeout 1800 --workers 1
     plan: starter
