@@ -1,39 +1,20 @@
 """
-FCPXML Generator + Asset Downloader + Caption Generator service - v19.
+FCPXML Generator + Asset Downloader service for Rough Cut Automation - v8.
 
-v19 changes:
-  - Fix alpha channel in captions.mov. The color=c=black@0.0 lavfi source
-    defaults to yuv420p (no alpha), so libass composited subtitles onto an
-    opaque canvas. Final yuva444p10le conversion then filled alpha with 100%
-    opaque values — file had alpha metadata but every pixel was fully opaque,
-    rendering as black in Premiere.
-    Fix: prepend format=rgba to the filter chain so the canvas carries alpha
-    from the start, and append format=yuva444p10le before the encoder.
+Adds /download-to-drive endpoint that:
+1. Calls Air's download URL endpoint for an asset version
+2. Streams the resulting file directly to Google Drive
+3. Returns success/error to caller (n8n)
 
-v18 changes:
-  - NEW /generate-captions endpoint:
-    1. Builds an ASS karaoke subtitle file from aligned beat data
-       (script text for spellings, Whisper word timings for sync).
-    2. Renders the ASS to a 1080×1920 transparent ProRes 4444 movie via FFmpeg.
-    3. Uploads both files to the project's Drive Output folder.
-  - /generate now accepts captionsFilename. When present, the FCPXML wires the
-    captions movie in as a V2 overlay clip on every sequence, referenced from
-    Footage/{captionsFilename} (same relative-path pattern as the avatar).
-  - Default karaoke style: white text, red active word, larger active word,
-    Komika Axis font (must be present at fonts/KomikaAxis.ttf in the repo).
+This bypasses n8n's disk/memory entirely — file bytes never touch n8n.
 
 Environment variables required:
-  AIR_API_KEY, AIR_WORKSPACE_ID
-  GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET, GOOGLE_OAUTH_REFRESH_TOKEN
-
-System requirements:
-  ffmpeg with libass (apt-get install -y ffmpeg in render.yaml buildCommand)
-  fonts/KomikaAxis.ttf bundled in repo
+  AIR_API_KEY               — Air API key (or use Bearer token)
+  GOOGLE_SERVICE_ACCOUNT_JSON — JSON string of the service account credentials
 
 Endpoints:
-  POST /generate              — generate FCPXML (caption-aware)
-  POST /download-to-drive     — download a single Air asset to a Drive folder
-  POST /generate-captions     — build ASS + render alpha-channel captions.mov
+  POST /generate              — generate FCPXML (existing)
+  POST /download-to-drive     — download a single Air asset to a Drive folder (NEW)
   GET  /health                — health check
 """
 
@@ -51,9 +32,6 @@ import requests
 import json
 import io
 import traceback
-import subprocess
-import shutil
-from pathlib import Path
 
 app = Flask(__name__)
 
@@ -126,7 +104,7 @@ def download_to_drive():
         "driveFolderId": "drive-folder-id",
         "skipIfExists": true
       }
-
+    
     Returns:
       Success: { "ok": true, "driveFileId": "...", "filename": "...", "bytesUploaded": N }
       Skipped: { "ok": true, "skipped": true, "reason": "..." }
@@ -139,15 +117,15 @@ def download_to_drive():
         filename = data.get("filename")
         drive_folder_id = data.get("driveFolderId")
         skip_if_exists = data.get("skipIfExists", True)
-
+        
         if not all([asset_id, version_id, filename, drive_folder_id]):
             return jsonify({
                 "ok": False,
                 "error": "Missing required field. Need: assetId, versionId, filename, driveFolderId"
             }), 400
-
+        
         drive = get_drive_service()
-
+        
         # Optionally skip if file already exists in folder
         if skip_if_exists:
             q = f"name = '{filename.replace(chr(39), chr(92)+chr(39))}' and '{drive_folder_id}' in parents and trashed = false"
@@ -160,16 +138,16 @@ def download_to_drive():
                     "driveFileId": existing["files"][0]["id"],
                     "filename": filename
                 })
-
+        
         # Step 1: ask Air for the actual download URL
         air_key = os.environ.get("AIR_API_KEY")
         if not air_key:
             return jsonify({"ok": False, "error": "AIR_API_KEY env var not set"}), 500
-
+        
         workspace_id = os.environ.get("AIR_WORKSPACE_ID")
         if not workspace_id:
             return jsonify({"ok": False, "error": "AIR_WORKSPACE_ID env var not set"}), 500
-
+        
         url_endpoint = f"{AIR_API_BASE}/assets/{asset_id}/versions/{version_id}/download"
         resp = requests.get(
             url_endpoint,
@@ -180,7 +158,7 @@ def download_to_drive():
             timeout=30,
             allow_redirects=False,
         )
-
+        
         download_url = None
         if 300 <= resp.status_code < 400 and resp.headers.get("location"):
             download_url = resp.headers["location"]
@@ -191,13 +169,13 @@ def download_to_drive():
             except Exception:
                 if resp.text.startswith("http"):
                     download_url = resp.text.strip()
-
+        
         if not download_url:
             return jsonify({
                 "ok": False,
                 "error": f"Could not extract download URL from Air. Status: {resp.status_code}. Body: {resp.text[:300]}"
             }), 500
-
+        
         # Step 2: stream the file from Air → Drive, in chunks, never holding full bytes
         # Use requests.get(stream=True) and feed to a generator-backed BytesIO
         with requests.get(download_url, stream=True, timeout=300) as file_resp:
@@ -206,7 +184,7 @@ def download_to_drive():
                     "ok": False,
                     "error": f"Failed to download from Air-provided URL. Status: {file_resp.status_code}"
                 }), 500
-
+            
             # Write to a tempfile so MediaIoBaseUpload can stream it to Drive
             # Tempfile is on Render disk (separate from n8n), and we delete it after
             with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
@@ -216,13 +194,13 @@ def download_to_drive():
                     if chunk:
                         tmp.write(chunk)
                         bytes_total += len(chunk)
-
+            
             try:
                 # Determine MIME type from filename extension
                 mime_type = "video/mp4"
                 if filename.lower().endswith((".mov", ".m4v")):
                     mime_type = "video/quicktime"
-
+                
                 # MediaFileUpload with resumable=True streams the file from disk in 5MB
                 # chunks — keeps memory usage low regardless of file size.
                 media = MediaFileUpload(
@@ -245,7 +223,7 @@ def download_to_drive():
                 while response is None:
                     status, response = request_obj.next_chunk()
                 created = response
-
+                
                 return jsonify({
                     "ok": True,
                     "driveFileId": created.get("id"),
@@ -257,7 +235,7 @@ def download_to_drive():
                     os.unlink(tmp_path)
                 except Exception:
                     pass
-
+    
     except Exception as e:
         return jsonify({
             "ok": False,
@@ -306,22 +284,6 @@ def make_avatar_reference(total_duration):
     )
     return otio.schema.ExternalReference(
         target_url="Footage/avatar.mp4", available_range=available_range,
-    )
-
-
-def make_captions_reference(total_duration, captions_filename):
-    """
-    Same pattern as make_avatar_reference but for the alpha-channel captions overlay.
-    captions_filename is the bare filename (e.g. "GC-VID-C6_captions.mov"); we wrap
-    it in Footage/ for the relative path the editor's Premiere will relink to.
-    """
-    available_range = TimeRange(
-        start_time=RationalTime(0, FRAME_RATE),
-        duration=seconds_to_rational_time(total_duration),
-    )
-    return otio.schema.ExternalReference(
-        target_url=f"Footage/{captions_filename}",
-        available_range=available_range,
     )
 
 
@@ -464,7 +426,7 @@ def identify_hook_segments(outcomes, total_duration):
     return hooks, body_start, body_end
 
 
-def build_concatenated_timeline(name, outcomes, video_type, segments, captions_filename=None):
+def build_concatenated_timeline(name, outcomes, video_type, segments):
     timeline = otio.schema.Timeline(name=name)
     timeline.global_start_time = RationalTime(0, FRAME_RATE)
     audio_track = otio.schema.Track(name="A1 — Avatar Audio", kind=otio.schema.TrackKind.Audio)
@@ -493,22 +455,6 @@ def build_concatenated_timeline(name, outcomes, video_type, segments, captions_f
                 ),
             )
             video_overlay_track.append(clip)
-    captions_track = None
-    if captions_filename:
-        captions_track_name = "V3 — Captions" if video_type == "talking_head_overlay" else "V2 — Captions"
-        captions_track = otio.schema.Track(name=captions_track_name, kind=otio.schema.TrackKind.Video)
-        for seg_start, seg_end in segments:
-            seg_duration = seg_end - seg_start
-            captions_ref = make_captions_reference(seg_end, captions_filename)
-            captions_clip = otio.schema.Clip(
-                name="Captions",
-                media_reference=captions_ref,
-                source_range=TimeRange(
-                    start_time=seconds_to_rational_time(seg_start),
-                    duration=seconds_to_rational_time(seg_duration),
-                ),
-            )
-            captions_track.append(captions_clip)
     v1_track = otio.schema.Track(name="V1 — B-roll", kind=otio.schema.TrackKind.Video)
     timeline_cursor = 0.0
     for seg_start, seg_end in segments:
@@ -577,13 +523,11 @@ def build_concatenated_timeline(name, outcomes, video_type, segments, captions_f
     timeline.tracks.append(v1_track)
     if video_overlay_track:
         timeline.tracks.append(video_overlay_track)
-    if captions_track:
-        timeline.tracks.append(captions_track)
     timeline.tracks.append(audio_track)
     return timeline
 
 
-def build_timeline_for_segment(name, outcomes, video_type, segment_start, segment_end, captions_filename=None):
+def build_timeline_for_segment(name, outcomes, video_type, segment_start, segment_end):
     timeline = otio.schema.Timeline(name=name)
     timeline.global_start_time = RationalTime(0, FRAME_RATE)
     asset_ids = {}
@@ -601,21 +545,6 @@ def build_timeline_for_segment(name, outcomes, video_type, segment_start, segmen
         )
         v2.append(clip)
         timeline.tracks.append(v2)
-    # Captions overlay always goes on the topmost video track.
-    if captions_filename:
-        captions_track_name = "V3 — Captions" if video_type == "talking_head_overlay" else "V2 — Captions"
-        captions_track = otio.schema.Track(name=captions_track_name, kind=otio.schema.TrackKind.Video)
-        captions_ref = make_captions_reference(segment_end, captions_filename)
-        captions_clip = otio.schema.Clip(
-            name="Captions",
-            media_reference=captions_ref,
-            source_range=TimeRange(
-                start_time=seconds_to_rational_time(segment_start),
-                duration=seconds_to_rational_time(segment_end - segment_start),
-            ),
-        )
-        captions_track.append(captions_clip)
-        timeline.tracks.append(captions_track)
     a1 = otio.schema.Track(name="A1 — Avatar Audio", kind=otio.schema.TrackKind.Audio)
     media_ref = make_avatar_reference(segment_end)
     clip = otio.schema.Clip(
@@ -691,7 +620,7 @@ def deduplicate_avatar_throughout(combined_xml):
 def wrap_in_bins(combined_xml):
     """
     Organize the project into Premiere bins:
-
+    
     [Project root]
     ├── Hook V1/        → just the sequence -V1
     ├── Hook V2/        → just the sequence -V2
@@ -700,7 +629,7 @@ def wrap_in_bins(combined_xml):
     ├── Hook V5/        → just the sequence -V5
     ├── Footage/        → standalone <clip> entries for each unique footage file
     └── Placeholders/   → standalone <clip> entries for each placeholder slug
-
+    
     The Footage and Placeholders bins contain <clip> elements that reference
     the same file IDs as the sequences. Premiere reads these as "this media
     item lives in this bin", overriding its default of placing media items
@@ -711,10 +640,10 @@ def wrap_in_bins(combined_xml):
         combined_xml,
         re.DOTALL,
     ))
-
+    
     if len(sequence_blocks) <= 1:
         return combined_xml
-
+    
     # Wrap each sequence in its Hook bin
     bin_wrapped = []
     for i, m in enumerate(sequence_blocks, start=1):
@@ -726,7 +655,7 @@ def wrap_in_bins(combined_xml):
             bin_name = f"Hook V{var_match.group(1)}" if var_match else f"Variation {i}"
         else:
             bin_name = f"Variation {i}"
-
+        
         bin_xml = f"""<bin>
                 <name>{bin_name}</name>
                 <children>
@@ -734,21 +663,21 @@ def wrap_in_bins(combined_xml):
                 </children>
             </bin>"""
         bin_wrapped.append(bin_xml)
-
+    
     # Replace each sequence with its Hook bin (in reverse to keep offsets valid)
     result = combined_xml
     for m, new_bin in zip(reversed(sequence_blocks), reversed(bin_wrapped)):
         start, end = m.span(1)
         result = result[:start] + new_bin + result[end:]
-
+    
     # Note: previous versions tried to add explicit Footage/Placeholders bins
     # using bare <file id=".."/> references, but FCP7 XML requires standalone
     # <clip> elements in bins to have their own full <file> definition with
     # <pathurl> etc. Bare references caused Premiere import failures.
-    #
+    # 
     # For now we only wrap sequences in Hook bins. Premiere will auto-place
     # the media items somewhere on import, which the editor can rearrange.
-
+    
     return result
 
 
@@ -792,7 +721,7 @@ def build_combined_fcpxml(sequences_xml_list, project_name, dimensions):
     return combined_xml
 
 
-def build_fcpxml(project_settings, outcomes, total_audio_duration, captions_filename=None):
+def build_fcpxml(project_settings, outcomes, total_audio_duration):
     tab_name = project_settings.get("tabName", "Untitled")
     video_type = project_settings.get("videoType", "narrated_story")
     dimensions = get_dimensions(project_settings.get("targetOrientation", "Portrait"))
@@ -802,7 +731,6 @@ def build_fcpxml(project_settings, outcomes, total_audio_duration, captions_file
         timeline = build_timeline_for_segment(
             name=tab_name, outcomes=outcomes, video_type=video_type,
             segment_start=0.0, segment_end=total_audio_duration,
-            captions_filename=captions_filename,
         )
         single_xml = timeline_to_fcpxml(timeline)
         return build_combined_fcpxml([single_xml], tab_name, dimensions)
@@ -812,7 +740,6 @@ def build_fcpxml(project_settings, outcomes, total_audio_duration, captions_file
         timeline = build_concatenated_timeline(
             name=seq_name, outcomes=outcomes, video_type=video_type,
             segments=[(hook["start"], hook["end"]), (body_start, body_end)],
-            captions_filename=captions_filename,
         )
         sequences_xml.append(timeline_to_fcpxml(timeline))
     return build_combined_fcpxml(sequences_xml, tab_name, dimensions)
@@ -825,17 +752,15 @@ def generate():
         project_settings = data.get("projectSettings", {})
         outcomes = data.get("outcomes", [])
         total_duration = data.get("totalAudioDuration", 0)
-        captions_filename = data.get("captionsFilename") or None
         if not outcomes:
             return jsonify({"error": "No outcomes provided"}), 400
         if not total_duration:
             return jsonify({"error": "totalAudioDuration is required"}), 400
-        fcpxml = build_fcpxml(project_settings, outcomes, total_duration, captions_filename=captions_filename)
+        fcpxml = build_fcpxml(project_settings, outcomes, total_duration)
         filename = f"{project_settings.get('tabName', 'output')}.xml"
         hooks, _, _ = identify_hook_segments(outcomes, total_duration)
         return jsonify({
             "fcpxml": fcpxml, "filename": filename,
-            "captionsFilename": captions_filename,
             "stats": {
                 "outcomeCount": len(outcomes),
                 "matchCount": sum(1 for o in outcomes if o.get("outcome") == "match"),
@@ -843,7 +768,6 @@ def generate():
                 "hookCount": len(hooks),
                 "sequenceCount": len(hooks) if len(hooks) > 1 else 1,
                 "totalDuration": total_duration,
-                "captionsEmbedded": bool(captions_filename),
             },
         })
     except Exception as e:
@@ -851,614 +775,6 @@ def generate():
             "error": str(e), "type": type(e).__name__,
             "traceback": traceback.format_exc()[-1500:],
         }), 500
-
-
-# ============================================================================
-# Caption generation
-# ============================================================================
-
-# Hardcoded MrBeast-style defaults. Move to per-client lookup later.
-CAPTION_STYLE_DEFAULTS = {
-    "fontName": "Komika Axis",         # must match what's installed in fontsdir
-    "fontFile": "KomikaAxis.ttf",      # bundled file in repo: fonts/KomikaAxis.ttf
-    "baseFontSize": 130,
-    "highlightFontSize": 150,
-    "baseColor": "FFFFFF",             # ASS BGR hex — white
-    "highlightColor": "0000FF",        # ASS BGR hex — red (BGR not RGB)
-    "outlineColor": "000000",          # black outline
-    "outlineWidth": 8,
-    "shadowDepth": 2,
-    "alignment": 2,                    # 2 = bottom-center
-    "marginV": 320,                    # pixels up from bottom
-    "marginL": 60,
-    "marginR": 60,
-    "wordsPerWindow": 3,               # how many words on screen at once
-    # Rough horizontal-width budget. Komika Axis at fs=130 with 8px outline is
-    # wide; we estimate per-char width + per-space width, scaled by the highlight
-    # size ratio, and use this as a hard max. The 880px budget (vs 960 video
-    # width minus margins) gives ~80px of safety margin so the layout can never
-    # be ambiguous enough to trigger a second-line wrap.
-    "maxWindowWidthPx": 880,
-    "estCharWidthPx": 85,
-    "estSpaceWidthPx": 40,
-    # Natural timing controls (v24).
-    # silentGapThreshold: if the gap between consecutive words exceeds this
-    # many seconds, let the screen go empty during the gap instead of holding
-    # the previous word. Tune up for more "breathing room", down to keep the
-    # line on screen more continuously.
-    "silentGapThreshold": 0.4,
-    # Max time a window's last word lingers on screen after it's been said.
-    # Capped by the next window's start regardless.
-    "maxHoldAfterLastWord": 0.6,
-    # Word-appear stretch animation duration (ms). Each highlighted word
-    # scales from 80% to 100% over this many ms when it becomes active —
-    # gives an AE-like pop. Set to 0 to disable.
-    "highlightStretchMs": 120,
-    "videoWidth": 1080,
-    "videoHeight": 1920,
-    "frameRate": 30,
-}
-
-# Local path inside the container/repo where bundled fonts live.
-BUNDLED_FONTS_DIR = Path(__file__).parent / "fonts"
-
-
-def _format_ass_time(sec):
-    """Format seconds as ASS time: H:MM:SS.cs (centiseconds)."""
-    if sec < 0:
-        sec = 0
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = int(sec % 60)
-    cs = int(round((sec - int(sec)) * 100))
-    if cs >= 100:
-        cs = 99
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-
-def _strip_ass_unsafe(text):
-    """ASS uses { and } for override blocks. Escape any literal braces in display text."""
-    return text.replace("{", "(").replace("}", ")")
-
-
-def _normalize_for_match(s):
-    """Lowercase + strip punctuation for token matching."""
-    return re.sub(r"[^\w]", "", s).lower()
-
-
-def _align_script_to_whisper(script_tokens, whisper_words):
-    """
-    Match each script token to a whisper word so each script token gets the
-    whisper word's actual start/end time, not a linearly-distributed slice.
-
-    Uses difflib.SequenceMatcher on the normalised token strings. Returns a
-    list the same length as script_tokens, where each entry is either the
-    matched whisper_word dict, or None if no good match was found.
-
-    When too few matches are found (mismatch ratio > 40%), returns None so
-    the caller falls back to linear distribution — the safer behaviour when
-    Whisper drops/adds words substantially.
-    """
-    from difflib import SequenceMatcher
-    if not script_tokens or not whisper_words:
-        return None
-    script_norm = [_normalize_for_match(t) for t in script_tokens]
-    whisper_norm = [_normalize_for_match(w.get("word", "")) for w in whisper_words]
-    matcher = SequenceMatcher(a=script_norm, b=whisper_norm, autojunk=False)
-    matches = [None] * len(script_tokens)
-    matched_count = 0
-    for block in matcher.get_matching_blocks():
-        # block.size==0 marks the end sentinel; skip.
-        if block.size == 0:
-            continue
-        for k in range(block.size):
-            i = block.a + k  # script index
-            j = block.b + k  # whisper index
-            matches[i] = whisper_words[j]
-            matched_count += 1
-    # If too many script tokens didn't get matched, signal a fallback.
-    if matched_count < len(script_tokens) * 0.6:
-        return None
-    # Fill unmatched script tokens by interpolating from neighbours so they
-    # still have plausible timestamps. Walk forward then back.
-    for i in range(len(matches)):
-        if matches[i] is not None:
-            continue
-        # Find nearest matched neighbours on either side.
-        prev_idx = i - 1
-        while prev_idx >= 0 and matches[prev_idx] is None:
-            prev_idx -= 1
-        next_idx = i + 1
-        while next_idx < len(matches) and matches[next_idx] is None:
-            next_idx += 1
-        if prev_idx >= 0 and next_idx < len(matches):
-            # Interpolate between the two matched neighbours.
-            t_prev = float(matches[prev_idx]["end"])
-            t_next = float(matches[next_idx]["start"])
-            gap_count = next_idx - prev_idx
-            local_offset = i - prev_idx
-            t_start = t_prev + (t_next - t_prev) * (local_offset - 1) / gap_count
-            t_end = t_prev + (t_next - t_prev) * local_offset / gap_count
-            matches[i] = {"word": script_tokens[i], "start": t_start, "end": t_end}
-        elif prev_idx >= 0:
-            # Tail of script with no later match — chain off previous.
-            t_prev = float(matches[prev_idx]["end"])
-            matches[i] = {"word": script_tokens[i], "start": t_prev, "end": t_prev + 0.2}
-        elif next_idx < len(matches):
-            t_next = float(matches[next_idx]["start"])
-            matches[i] = {"word": script_tokens[i], "start": max(0, t_next - 0.2), "end": t_next}
-        else:
-            # No matches at all — shouldn't happen given the matched_count guard.
-            return None
-    return matches
-
-
-def _collect_caption_words(aligned_beats):
-    """
-    Flatten aligned beats into a single list of caption word records. We pair
-    each script-text word with its actual Whisper timestamp (when alignment
-    succeeds) so the displayed caption uses the script's spelling but the
-    timing tracks what was actually said.
-
-    Falls back to linear distribution across the beat's Whisper span when
-    fuzzy alignment is too weak.
-
-    Returns a list of dicts: { display, start, end }.
-    """
-    caption_words = []
-    for beat in aligned_beats:
-        whisper_words = beat.get("whisperWords") or []
-        if not whisper_words:
-            continue
-        narrated = (beat.get("narratedCopy") or "").strip()
-        if not narrated:
-            continue
-        script_tokens = [t for t in narrated.split() if t]
-        if not script_tokens:
-            continue
-        # Best case — counts match, zip 1:1.
-        if len(script_tokens) == len(whisper_words):
-            for tok, ww in zip(script_tokens, whisper_words):
-                caption_words.append({
-                    "display": _strip_ass_unsafe(tok),
-                    "start": float(ww["start"]),
-                    "end": float(ww["end"]),
-                })
-            continue
-        # Counts mismatch — try fuzzy alignment first.
-        aligned = _align_script_to_whisper(script_tokens, whisper_words)
-        if aligned is not None:
-            for tok, ww in zip(script_tokens, aligned):
-                caption_words.append({
-                    "display": _strip_ass_unsafe(tok),
-                    "start": float(ww["start"]),
-                    "end": float(ww["end"]),
-                })
-            continue
-        # Fallback — linear distribution across the beat's whisper span.
-        n_script = len(script_tokens)
-        t_start = float(whisper_words[0]["start"])
-        t_end = float(whisper_words[-1]["end"])
-        total = max(t_end - t_start, 1e-3)
-        for i, tok in enumerate(script_tokens):
-            frac_a = i / n_script
-            frac_b = (i + 1) / n_script
-            caption_words.append({
-                "display": _strip_ass_unsafe(tok),
-                "start": t_start + frac_a * total,
-                "end": t_start + frac_b * total,
-            })
-    return caption_words
-
-
-def _estimate_window_width(window_words, cfg):
-    """
-    Rough width estimate of a window when rendered. We use the highlight font
-    size (the larger one) for whichever word is active, but to keep this
-    cheap we just assume the widest case: every word at highlight size, plus
-    spaces between them. This over-estimates slightly, which is what we want
-    — better to split a borderline 3-word window into 2+1 than overflow.
-    """
-    if not window_words:
-        return 0
-    char_total = sum(len(w["display"]) for w in window_words)
-    spaces = max(0, len(window_words) - 1)
-    # Scale char width by the size ratio so the estimate tracks both base and
-    # highlight sizes proportionally.
-    size_ratio = cfg["highlightFontSize"] / cfg["baseFontSize"]
-    return int(char_total * cfg["estCharWidthPx"] * size_ratio + spaces * cfg["estSpaceWidthPx"])
-
-
-def _group_words_into_windows(words, cfg, max_gap=1.5):
-    """
-    Group consecutive words into on-screen 'windows'. Start a new window when
-    (a) window is at the soft-cap (wordsPerWindow), (b) a sentence-ending
-    word is hit, (c) there's a large time gap to the next word, or
-    (d) adding the next word would push the rendered width past maxWindowWidthPx.
-
-    The width check is what guarantees we never overflow the frame: a 3-word
-    window of long words gets split into 2+1, etc.
-    """
-    if not words:
-        return []
-    words_per_window = cfg["wordsPerWindow"]
-    max_width = cfg["maxWindowWidthPx"]
-    groups = []
-    current = []
-    for i, w in enumerate(words):
-        # Try to add w to current. If that would overflow on width, flush first.
-        prospective = current + [w]
-        if current and _estimate_window_width(prospective, cfg) > max_width:
-            groups.append(current)
-            current = [w]
-        else:
-            current.append(w)
-        ends_sentence = w["display"].rstrip().endswith((".", "?", "!"))
-        is_full = len(current) >= words_per_window
-        is_last = i == len(words) - 1
-        big_gap = False
-        if not is_last:
-            big_gap = (words[i + 1]["start"] - w["end"]) > max_gap
-        if is_full or ends_sentence or is_last or big_gap:
-            groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
-    return groups
-
-
-def _build_ass(aligned_beats, style=None):
-    """
-    Generate an ASS subtitle string with per-word karaoke highlighting.
-    For each word in each window, emit one Dialogue line covering that word's
-    timespan, showing the full window text with the active word styled larger
-    and in the highlight color.
-    """
-    cfg = {**CAPTION_STYLE_DEFAULTS, **(style or {})}
-
-    # ASS header. PlayResX/Y set the canvas the renderer maps coordinates onto.
-    header = (
-        "[Script Info]\n"
-        "Title: Rough Cut Captions\n"
-        "ScriptType: v4.00+\n"
-        f"PlayResX: {cfg['videoWidth']}\n"
-        f"PlayResY: {cfg['videoHeight']}\n"
-        "WrapStyle: 2\n"
-        "ScaledBorderAndShadow: yes\n"
-        "\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{cfg['fontName']},{cfg['baseFontSize']},"
-        f"&H00{cfg['baseColor']},&H00{cfg['baseColor']},"
-        f"&H00{cfg['outlineColor']},&H00000000,"
-        f"-1,0,0,0,100,100,0,0,1,{cfg['outlineWidth']},{cfg['shadowDepth']},"
-        f"{cfg['alignment']},{cfg['marginL']},{cfg['marginR']},{cfg['marginV']},1\n"
-        "\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-    )
-
-    words = _collect_caption_words(aligned_beats)
-    if not words:
-        # No captions — return a valid but empty ASS (renders to fully transparent video).
-        return header
-
-    windows = _group_words_into_windows(words, cfg)
-    # Pre-compute each window's bounds. window_end is now "soft" — we let the
-    # last word stay on screen up to maxHoldAfterLastWord seconds, but never
-    # past the next window's first word start.
-    max_hold = cfg["maxHoldAfterLastWord"]
-    silent_gap_threshold = cfg["silentGapThreshold"]
-    stretch_ms = cfg["highlightStretchMs"]
-
-    dialogue_lines = []
-    for w_idx, window in enumerate(windows):
-        # Determine when this window must release the screen at the latest.
-        if w_idx + 1 < len(windows):
-            next_window_start = windows[w_idx + 1][0]["start"]
-        else:
-            next_window_start = window[-1]["end"] + max_hold
-
-        for idx, active in enumerate(window):
-            parts = []
-            for j, w in enumerate(window):
-                if j > 0:
-                    parts.append(" ")
-                if j == idx:
-                    # Highlight + stretch animation. Start scale at 90% (not
-                    # lower) because a bigger initial size mismatch can cause
-                    # libass to re-layout the line during the animation and
-                    # briefly wrap to two rows. 90→100 is small enough to feel
-                    # like a pop but not shift the layout.
-                    parts.append(
-                        f"{{"
-                        f"\\fs{cfg['highlightFontSize']}"
-                        f"\\c&H{cfg['highlightColor']}&"
-                        f"\\fscx90\\fscy90"
-                        f"\\t(0,{stretch_ms},\\fscx100\\fscy100)"
-                        f"}}"
-                        f"{w['display']}"
-                        f"{{\\r}}"
-                    )
-                else:
-                    parts.append(w["display"])
-            text = "".join(parts)
-
-            # Event-start: when this word becomes active (its spoken start).
-            event_start = active["start"]
-
-            # Event-end logic:
-            # - If there's another word in this window, end when that next word
-            #   becomes active. UNLESS there's a long silent gap, in which case
-            #   end at this word's spoken `end` and let the screen go empty
-            #   until the next word's start.
-            # - If this is the last word in the window, hold up to max_hold
-            #   seconds OR until the next window starts, whichever is first.
-            #   Also respect silent_gap_threshold to the next window.
-            if idx + 1 < len(window):
-                next_word_start = window[idx + 1]["start"]
-                gap = next_word_start - active["end"]
-                if gap > silent_gap_threshold:
-                    event_end = active["end"]
-                else:
-                    event_end = next_word_start
-            else:
-                gap_to_next_window = next_window_start - active["end"]
-                hold = min(max_hold, max(0, gap_to_next_window))
-                if gap_to_next_window > silent_gap_threshold:
-                    # Pause long enough to feel like a beat — release after
-                    # the word's spoken end, leaving silent screen until next.
-                    event_end = active["end"] + min(0.15, hold)
-                else:
-                    event_end = active["end"] + hold
-
-            if event_end <= event_start:
-                event_end = event_start + 0.05
-            dialogue_lines.append(
-                f"Dialogue: 0,{_format_ass_time(event_start)},{_format_ass_time(event_end)},"
-                f"Default,,0,0,0,,{text}"
-            )
-
-    # Bridge tiny gaps between consecutive active-word events so there is no flicker.
-    # We rewrite end times in-place when the next dialogue is from the same window.
-    final = []
-    for i, line in enumerate(dialogue_lines):
-        final.append(line)
-    return header + "\n".join(final) + "\n"
-
-
-def _render_captions_mov(ass_path, mov_path, duration_seconds, style=None):
-    """
-    Render ASS subtitles to a 1080×1920 ProRes 4444 .mov with true alpha channel.
-
-    v19 fix: color=c=black@0.0 lavfi source defaults to yuv420p (no alpha), so
-    libass composited subtitles onto an opaque canvas. Final yuva conversion
-    filled alpha with 100% opaque values — file had alpha metadata but every
-    pixel was fully opaque, rendering as black in Premiere.
-    Now: prepend format=rgba so the canvas carries alpha from the start, then
-    append format=yuva444p10le right before the encoder.
-
-    Streams FFmpeg stderr line-by-line into a bounded ring buffer instead of
-    using capture_output=True, which buffers everything in RAM and OOMs on
-    long renders.
-    """
-    import collections
-
-    cfg = {**CAPTION_STYLE_DEFAULTS, **(style or {})}
-    width = cfg["videoWidth"]
-    height = cfg["videoHeight"]
-    fps = cfg["frameRate"]
-    duration = max(duration_seconds + 0.5, 1.0)
-
-    ass_abs = os.path.abspath(ass_path)
-    fonts_dir = str(BUNDLED_FONTS_DIR.resolve())
-
-    def _escape_filter_path(p):
-        return p.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-
-    ass_escaped = _escape_filter_path(ass_abs)
-    fonts_escaped = _escape_filter_path(fonts_dir)
-
-    # v21: libass with alpha=1 has been unreliable in our FFmpeg build —
-    # the output keeps coming back fully opaque despite yuva pix_fmt.
-    # Switching to a chroma-key approach: render text on bright magenta
-    # (a color that will never appear in Komika Axis white/red captions),
-    # then key it out with colorkey. Reliable and predictable.
-    vf = (
-        f"subtitles=filename='{ass_escaped}'"
-        f":fontsdir='{fonts_escaped}',"
-        f"colorkey=color=0xFF00FF:similarity=0.01:blend=0.0,"
-        f"format=yuva444p10le"
-    )
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-hide_banner",
-        "-loglevel", "error",
-        "-f", "lavfi",
-        "-i", f"color=c=0xFF00FF:s={width}x{height}:r={fps}:d={duration:.2f}",
-        "-vf", vf,
-        "-c:v", "prores_ks",
-        "-profile:v", "4444",
-        "-pix_fmt", "yuva444p10le",
-        "-an",
-        "-alpha_bits", "16",
-        mov_path,
-    ]
-
-    stderr_tail_buf = collections.deque(maxlen=200)
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-    try:
-        assert proc.stderr is not None
-        for line in proc.stderr:
-            stderr_tail_buf.append(line)
-        proc.wait(timeout=480)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-        raise
-
-    if proc.returncode != 0:
-        stderr_tail = "".join(stderr_tail_buf)[-1500:]
-        raise RuntimeError(
-            f"FFmpeg failed (exit {proc.returncode}). Tail: {stderr_tail}"
-        )
-
-
-def _upload_to_drive(local_path, drive_folder_id, filename, mime_type):
-    """Upload a local file to a Drive folder using resumable upload. Returns file id."""
-    drive = get_drive_service()
-    media = MediaFileUpload(
-        local_path,
-        mimetype=mime_type,
-        resumable=True,
-        chunksize=5 * 1024 * 1024,
-    )
-    metadata = {
-        "name": filename,
-        "parents": [drive_folder_id],
-    }
-    req = drive.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id,name",
-    )
-    response = None
-    while response is None:
-        _, response = req.next_chunk()
-    return response.get("id")
-
-
-def _delete_existing_in_folder(filename, drive_folder_id):
-    """Remove any existing file with the same name in the folder so the new upload
-    is the only one. Avoids accumulation of `captions (1).mov`, `captions (2).mov`."""
-    drive = get_drive_service()
-    safe = filename.replace("'", "\\'")
-    q = f"name = '{safe}' and '{drive_folder_id}' in parents and trashed = false"
-    existing = drive.files().list(q=q, fields="files(id)", pageSize=10).execute()
-    for f in existing.get("files", []):
-        try:
-            drive.files().delete(fileId=f["id"]).execute()
-        except Exception:
-            pass
-
-
-@app.route("/generate-captions", methods=["POST"])
-def generate_captions():
-    """
-    Body:
-      {
-        "tabName": "GC-VID-C6",
-        "alignedBeats": [ ... ],          # output from 03_transcript_aligner_v8
-        "totalAudioDuration": 42.5,
-        "driveFolderId": "drive-folder-id",  # where to upload captions.mov + .ass
-                                              # typically the Footage/ subfolder
-        "clientCode": "GC"                # reserved for future per-client style lookup
-      }
-
-    Returns:
-      {
-        "ok": true,
-        "captionsFilename": "GC-VID-C6_captions.mov",
-        "captionsAssFilename": "GC-VID-C6_captions.ass",
-        "captionsMovDriveId": "...",
-        "captionsAssDriveId": "...",
-        "wordsRendered": 137
-      }
-    """
-    work_dir = None
-    try:
-        data = request.get_json(force=True)
-        tab_name = data.get("tabName")
-        aligned_beats = data.get("alignedBeats") or []
-        total_duration = float(data.get("totalAudioDuration") or 0)
-        drive_folder_id = data.get("driveFolderId") or data.get("outputFolderId")
-
-        if not tab_name:
-            return jsonify({"ok": False, "error": "tabName is required"}), 400
-        if not drive_folder_id:
-            return jsonify({"ok": False, "error": "driveFolderId is required"}), 400
-        if total_duration <= 0:
-            return jsonify({"ok": False, "error": "totalAudioDuration must be > 0"}), 400
-        if not aligned_beats:
-            return jsonify({"ok": False, "error": "alignedBeats is required"}), 400
-
-        # Verify FFmpeg is installed at request-time so we get a clean error message
-        # rather than a cryptic subprocess failure on first run.
-        if shutil.which("ffmpeg") is None:
-            return jsonify({
-                "ok": False,
-                "error": "ffmpeg not found on PATH. Ensure render.yaml buildCommand installs ffmpeg.",
-            }), 500
-        if not BUNDLED_FONTS_DIR.exists():
-            return jsonify({
-                "ok": False,
-                "error": f"Bundled fonts directory missing: {BUNDLED_FONTS_DIR}. "
-                         f"Ensure fonts/KomikaAxis.ttf is committed to the repo.",
-            }), 500
-
-        ass_filename = f"{tab_name}_captions.ass"
-        mov_filename = f"{tab_name}_captions.mov"
-
-        # Build ASS content.
-        ass_text = _build_ass(aligned_beats)
-
-        # Write ASS to a scratch dir, then render via FFmpeg.
-        work_dir = tempfile.mkdtemp(prefix="captions_")
-        ass_path = os.path.join(work_dir, ass_filename)
-        mov_path = os.path.join(work_dir, mov_filename)
-        with open(ass_path, "w", encoding="utf-8") as f:
-            f.write(ass_text)
-
-        _render_captions_mov(ass_path, mov_path, total_duration)
-
-        # Upload both to Drive. Clean up any prior copies first.
-        _delete_existing_in_folder(ass_filename, drive_folder_id)
-        _delete_existing_in_folder(mov_filename, drive_folder_id)
-        ass_drive_id = _upload_to_drive(ass_path, drive_folder_id, ass_filename, "text/plain")
-        mov_drive_id = _upload_to_drive(mov_path, drive_folder_id, mov_filename, "video/quicktime")
-
-        words_rendered = sum(
-            len(beat.get("whisperWords") or [])
-            for beat in aligned_beats
-        )
-
-        return jsonify({
-            "ok": True,
-            "captionsFilename": mov_filename,
-            "captionsAssFilename": ass_filename,
-            "captionsMovDriveId": mov_drive_id,
-            "captionsAssDriveId": ass_drive_id,
-            "wordsRendered": words_rendered,
-        })
-
-    except subprocess.TimeoutExpired:
-        return jsonify({
-            "ok": False,
-            "error": "FFmpeg timed out (>480s) rendering captions.",
-        }), 500
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-            "type": type(e).__name__,
-            "traceback": traceback.format_exc()[-1500:],
-        }), 500
-    finally:
-        if work_dir and os.path.isdir(work_dir):
-            try:
-                shutil.rmtree(work_dir)
-            except Exception:
-                pass
 
 
 @app.route("/health", methods=["GET"])
@@ -1469,29 +785,24 @@ def health():
         drive_ok = True
     except Exception as e:
         drive_ok = f"Error: {e}"
-    ffmpeg_path = shutil.which("ffmpeg")
-    font_file = BUNDLED_FONTS_DIR / CAPTION_STYLE_DEFAULTS["fontFile"]
     return jsonify({
         "status": "ok", "service": "fcpxml-generator",
-        "version": "v25-wrap-safety",
+        "version": "v17-no-dot-slash-prefix",
         "otio_version": otio.__version__,
         "drive_credentials": drive_ok,
         "air_credentials": "ok" if os.environ.get("AIR_API_KEY") else "missing",
         "air_workspace_id": "ok" if os.environ.get("AIR_WORKSPACE_ID") else "missing",
-        "ffmpeg": ffmpeg_path or "missing",
-        "caption_font": "ok" if font_file.exists() else f"missing: {font_file}",
     })
 
 
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
-        "service": "FCPXML Generator + Asset Downloader + Caption Generator",
-        "version": "v19",
+        "service": "FCPXML Generator + Asset Downloader",
+        "version": "v17",
         "endpoints": {
-            "POST /generate": "Generate FCPXML from beat outcomes (now accepts captionsFilename)",
+            "POST /generate": "Generate FCPXML from beat outcomes",
             "POST /download-to-drive": "Download an Air asset directly to a Drive folder",
-            "POST /generate-captions": "Build ASS karaoke + render alpha-channel captions.mov to Drive",
             "GET /health": "Health check",
         },
     })
